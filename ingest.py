@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
@@ -14,20 +15,38 @@ from qdrant_client.http import models
 # =============================================================================
 #
 # Flow:
-#   text files -> semantic-ish chunks -> Qwen metadata extraction -> embeddings
-#   -> Qdrant collection with rich payload metadata
+#   text files
+#   -> paragraph/heading-aware chunks
+#   -> Qwen metadata extraction
+#   -> Qwen embeddings
+#   -> Qdrant dense vector collection
+#   -> SQLite FTS5 lexical index
+#
+# This file is now responsible for keeping BOTH retrieval stores in sync:
+#
+#   1. Qdrant:
+#      - dense vectors
+#      - full payload metadata
+#      - authoritative chunk payload used by ask/search/eval
+#
+#   2. lexical.sqlite:
+#      - lightweight lexical FTS5 index
+#      - used by hybrid retrieval through rag_retrieval.py
+#      - stores only file_path/file_name/chunk_index/content
 #
 # Design goals:
 #   - local-first: llama-server for embeddings and instruct model
 #   - trustable ingestion: strict metadata schema, fail-fast on protocol errors
 #   - senior-ish chunking: paragraph/heading-aware instead of raw char slicing
-#   - scalable enough for v1: Qdrant payload indexes, batch metadata extraction
-#   - observable by default: stdout shows chunk stats, batch plan, retries, summary
+#   - observable by default: stdout shows chunk stats, metadata retries, Qdrant
+#     points, lexical rows, skipped drops, and final summary
 #
 # Important:
-#   - This script still does full re-ingest by design.
-#   - Incremental ingest / cache / manifest are intentionally not implemented yet.
-#   - Chunks marked corpus_decision="drop" are not indexed by default.
+#   - Full re-ingest is intentional for now.
+#   - Incremental ingest / cache / manifest are deferred.
+#   - CHUNK_SIZE is a target, not a hard cap.
+#   - Chunks marked corpus_decision="drop" are NOT indexed by default.
+#   - If a chunk is skipped as drop, it is skipped from BOTH Qdrant and FTS.
 # =============================================================================
 
 
@@ -39,9 +58,14 @@ CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/complet
 QDRANT_URL = os.environ.get("RAG_QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.environ.get("RAG_COLLECTION", "rag_v1_chunks")
 
+LEXICAL_DB_PATH = os.environ.get(
+    "RAG_LEXICAL_DB",
+    os.path.expanduser("~/rag_v1/lexical.sqlite"),
+)
+
 # CHUNK_SIZE is a target, not a hard maximum.
 # Paragraph/heading-aware chunking preserves readable units and overlap as much
-# as possible, so some chunks can exceed this target moderately.
+# as possible, so some chunks can moderately exceed this target.
 CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "1400"))
 OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "250"))
 
@@ -50,7 +74,7 @@ METADATA_MAX_REQUESTS_PER_FILE = int(os.environ.get("RAG_METADATA_MAX_REQUESTS_P
 METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "30"))
 
 # Default: do NOT index chunks classified as drop.
-# For debugging, run:
+# For debugging:
 #   RAG_INDEX_DROPPED_CHUNKS=1 python3 ~/rag_v1/ingest.py
 INDEX_DROPPED_CHUNKS = os.environ.get("RAG_INDEX_DROPPED_CHUNKS", "0") == "1"
 
@@ -140,7 +164,8 @@ STATS = {
     "metadata_initial_batches": 0,
     "metadata_actual_requests": 0,
     "chunks_total": 0,
-    "points_total": 0,
+    "qdrant_points_total": 0,
+    "lexical_rows_total": 0,
     "dropped_chunks_skipped": 0,
 }
 
@@ -1059,6 +1084,119 @@ def create_payload_indexes(client: QdrantClient):
         client.create_payload_index(COLLECTION, field, schema)
 
 
+# =============================================================================
+# SQLite FTS5 lexical index setup
+# =============================================================================
+
+def sqlite_supports_fts5() -> bool:
+    """
+    Fast runtime check so ingest fails early if Python's SQLite lacks FTS5.
+    """
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+        conn.close()
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def reset_lexical_db(path: str):
+    """
+    Create a fresh lexical index for full re-ingest.
+
+    Schema is intentionally minimal and matches rag_retrieval.py expectations.
+    Qdrant remains the authoritative metadata store; lexical.sqlite is only for
+    BM25/FTS lexical candidate generation.
+    """
+    if not sqlite_supports_fts5():
+        raise RuntimeError(
+            "SQLite FTS5 is not available in this Python build. "
+            "Hybrid lexical retrieval requires FTS5."
+        )
+
+    db_path = Path(path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if db_path.exists():
+        db_path.unlink()
+
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+    conn.execute(
+        """
+        CREATE TABLE chunks (
+                                rowid INTEGER PRIMARY KEY,
+                                file_path TEXT NOT NULL,
+                                file_name TEXT NOT NULL,
+                                chunk_index INTEGER NOT NULL,
+                                content TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX idx_chunks_file_chunk
+            ON chunks(file_path, chunk_index)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            content,
+            file_name,
+            tokenize='unicode61',
+            content='chunks',
+            content_rowid='rowid'
+        )
+        """
+    )
+
+    conn.commit()
+    return conn
+
+
+def insert_lexical_row(conn, rowid: int, file_path: str, file_name: str, chunk_index: int, content: str):
+    """
+    Insert one chunk into both:
+      - chunks metadata table
+      - chunks_fts FTS5 index
+
+    rowid is kept aligned with Qdrant point id for simpler debugging.
+    """
+    conn.execute(
+        """
+        INSERT INTO chunks(rowid, file_path, file_name, chunk_index, content)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (rowid, file_path, file_name, chunk_index, content),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO chunks_fts(rowid, content, file_name)
+        VALUES (?, ?, ?)
+        """,
+        (rowid, content, file_name),
+    )
+
+
+def lexical_row_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+
+
+def lexical_fts_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0])
+
+
+# =============================================================================
+# Reporting helpers
+# =============================================================================
+
 def print_document_metadata_summary(document_meta, chunk_metas):
     role_counts = defaultdict(int)
     facet_counts = defaultdict(int)
@@ -1115,6 +1253,7 @@ def main():
     print(f"Qdrant URL: {QDRANT_URL}")
     print(f"Embedding URL: {EMBED_URL}")
     print(f"Chat URL: {CHAT_URL}")
+    print(f"Lexical DB: {LEXICAL_DB_PATH}")
     print(f"Files found: {len(files)}")
     print(f"Chunking: paragraph/heading-aware; chunk_size_target={CHUNK_SIZE}; overlap={OVERLAP}")
     print(
@@ -1126,15 +1265,21 @@ def main():
     print(f"Verbose: {VERBOSE}; Debug raw payloads: {DEBUG}")
     print()
 
+    print("Checking SQLite FTS5 support...")
+    if not sqlite_supports_fts5():
+        raise SystemExit("SQLite FTS5 is not available. Cannot build lexical.sqlite.")
+    print("SQLite FTS5: available")
+
     client = QdrantClient(url=QDRANT_URL)
+
     dim = len(embed("probe"))
     print(f"Embedding dimension probe: {dim}")
 
     if client.collection_exists(COLLECTION):
-        print(f"Deleting existing collection: {COLLECTION}")
+        print(f"Deleting existing Qdrant collection: {COLLECTION}")
         client.delete_collection(COLLECTION)
 
-    print(f"Creating collection: {COLLECTION}")
+    print(f"Creating Qdrant collection: {COLLECTION}")
     client.create_collection(
         collection_name=COLLECTION,
         vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
@@ -1142,93 +1287,127 @@ def main():
 
     create_payload_indexes(client)
 
+    print(f"Creating fresh lexical SQLite FTS5 index: {LEXICAL_DB_PATH}")
+    lexical_conn = reset_lexical_db(LEXICAL_DB_PATH)
+
     point_id = 1
 
-    for file_num, path in enumerate(files, start=1):
-        print()
-        print("=" * 100)
-        print(f"FILE {file_num}/{len(files)}: {path.name}")
-        print("=" * 100)
+    try:
+        for file_num, path in enumerate(files, start=1):
+            print()
+            print("=" * 100)
+            print(f"FILE {file_num}/{len(files)}: {path.name}")
+            print("=" * 100)
 
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        print(f"  raw chars: {len(text)}")
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            print(f"  raw chars: {len(text)}")
 
-        chunks = chunk_text(text)
-        print_chunk_stats(chunks)
+            chunks = chunk_text(text)
+            print_chunk_stats(chunks)
 
-        STATS["chunks_total"] += len(chunks)
+            STATS["chunks_total"] += len(chunks)
 
-        chunk_metas = [None] * len(chunks)
+            chunk_metas = [None] * len(chunks)
 
-        batches = make_balanced_batches(
-            chunks,
-            target_batch_size=METADATA_TARGET_BATCH_SIZE,
-            max_requests=METADATA_MAX_REQUESTS_PER_FILE,
-            max_batch_size=METADATA_MAX_BATCH_SIZE,
-        )
-
-        STATS["metadata_initial_batches"] += len(batches)
-        print(f"  metadata batches planned: {[len(b) for b in batches]}")
-
-        for batch_num, batch in enumerate(batches, start=1):
-            start_index = batch[0]["chunk_index"]
-            end_index = batch[-1]["chunk_index"]
-
-            print(
-                f"  metadata batch {batch_num}/{len(batches)} "
-                f"chunks {start_index + 1}-{end_index + 1}/{len(chunks)} "
-                f"size={len(batch)}",
-                flush=True,
+            batches = make_balanced_batches(
+                chunks,
+                target_batch_size=METADATA_TARGET_BATCH_SIZE,
+                max_requests=METADATA_MAX_REQUESTS_PER_FILE,
+                max_batch_size=METADATA_MAX_BATCH_SIZE,
             )
 
-            try:
-                batch_result = extract_chunk_metadata_batch_with_retry(batch, file_name=path.name)
-            except Exception:
-                print(f"❌ FAILED: {path.name} batch={batch_num} start_chunk={start_index}")
-                raise
+            STATS["metadata_initial_batches"] += len(batches)
+            print(f"  metadata batches planned: {[len(b) for b in batches]}")
 
-            for chunk_index, meta in batch_result.items():
-                chunk_metas[chunk_index] = meta
+            for batch_num, batch in enumerate(batches, start=1):
+                start_index = batch[0]["chunk_index"]
+                end_index = batch[-1]["chunk_index"]
 
-        if any(m is None for m in chunk_metas):
-            missing = [i for i, m in enumerate(chunk_metas) if m is None]
-            raise RuntimeError(f"Missing metadata for chunks: {missing}")
+                print(
+                    f"  metadata batch {batch_num}/{len(batches)} "
+                    f"chunks {start_index + 1}-{end_index + 1}/{len(chunks)} "
+                    f"size={len(batch)}",
+                    flush=True,
+                )
 
-        document_meta = aggregate_document_metadata(chunk_metas)
-        print_document_metadata_summary(document_meta, chunk_metas)
+                try:
+                    batch_result = extract_chunk_metadata_batch_with_retry(batch, file_name=path.name)
+                except Exception:
+                    print(f"❌ FAILED: {path.name} batch={batch_num} start_chunk={start_index}")
+                    raise
 
-        points = []
-        skipped_drop = 0
+                for chunk_index, meta in batch_result.items():
+                    chunk_metas[chunk_index] = meta
 
-        for i, chunk in enumerate(chunks):
-            chunk_meta = chunk_metas[i]
+            if any(m is None for m in chunk_metas):
+                missing = [i for i, m in enumerate(chunk_metas) if m is None]
+                raise RuntimeError(f"Missing metadata for chunks: {missing}")
 
-            if chunk_meta["corpus_decision"] == "drop" and not INDEX_DROPPED_CHUNKS:
-                skipped_drop += 1
-                continue
+            document_meta = aggregate_document_metadata(chunk_metas)
+            print_document_metadata_summary(document_meta, chunk_metas)
 
-            vec = embed(chunk)
+            qdrant_points = []
+            lexical_rows_for_file = 0
+            skipped_drop = 0
 
-            payload = {
-                "file_path": str(path),
-                "file_name": path.name,
-                "chunk_index": i,
-                "content": chunk,
-                **chunk_meta,
-                **document_meta,
-            }
+            for i, chunk in enumerate(chunks):
+                chunk_meta = chunk_metas[i]
 
-            points.append(models.PointStruct(id=point_id, vector=vec, payload=payload))
-            point_id += 1
+                if chunk_meta["corpus_decision"] == "drop" and not INDEX_DROPPED_CHUNKS:
+                    skipped_drop += 1
+                    continue
 
-        if points:
-            client.upsert(collection_name=COLLECTION, points=points)
+                vec = embed(chunk)
 
-        STATS["points_total"] += len(points)
-        STATS["dropped_chunks_skipped"] += skipped_drop
+                payload = {
+                    "file_path": str(path),
+                    "file_name": path.name,
+                    "chunk_index": i,
+                    "content": chunk,
+                    **chunk_meta,
+                    **document_meta,
+                }
 
-        print(f"  skipped drop chunks: {skipped_drop}")
-        print(f"  upserted points: {len(points)}")
+                qdrant_points.append(
+                    models.PointStruct(
+                        id=point_id,
+                        vector=vec,
+                        payload=payload,
+                    )
+                )
+
+                insert_lexical_row(
+                    conn=lexical_conn,
+                    rowid=point_id,
+                    file_path=str(path),
+                    file_name=path.name,
+                    chunk_index=i,
+                    content=chunk,
+                )
+                lexical_rows_for_file += 1
+
+                point_id += 1
+
+            if qdrant_points:
+                client.upsert(collection_name=COLLECTION, points=qdrant_points)
+
+            lexical_conn.commit()
+
+            STATS["qdrant_points_total"] += len(qdrant_points)
+            STATS["lexical_rows_total"] += lexical_rows_for_file
+            STATS["dropped_chunks_skipped"] += skipped_drop
+
+            print(f"  skipped drop chunks: {skipped_drop}")
+            print(f"  upserted Qdrant points: {len(qdrant_points)}")
+            print(f"  inserted lexical rows: {lexical_rows_for_file}")
+
+    finally:
+        lexical_conn.commit()
+
+        total_rows = lexical_row_count(lexical_conn)
+        total_fts_rows = lexical_fts_count(lexical_conn)
+
+        lexical_conn.close()
 
     print()
     print("=" * 100)
@@ -1240,8 +1419,28 @@ def main():
     print(f"Actual metadata requests including retries: {STATS['metadata_actual_requests']}")
     print(f"Metadata retry splits: {STATS['metadata_retries']}")
     print(f"Drop chunks skipped: {STATS['dropped_chunks_skipped']}")
-    print(f"Points inserted: {STATS['points_total']}")
-    print(f"Collection: {COLLECTION}")
+    print(f"Qdrant points inserted: {STATS['qdrant_points_total']}")
+    print(f"Lexical rows inserted: {STATS['lexical_rows_total']}")
+    print(f"Lexical chunks table rows: {total_rows}")
+    print(f"Lexical FTS rows: {total_fts_rows}")
+    print(f"Qdrant collection: {COLLECTION}")
+    print(f"Lexical DB: {LEXICAL_DB_PATH}")
+
+    if STATS["qdrant_points_total"] != STATS["lexical_rows_total"]:
+        raise RuntimeError(
+            "Qdrant/lexical index mismatch: "
+            f"qdrant_points={STATS['qdrant_points_total']} "
+            f"lexical_rows={STATS['lexical_rows_total']}"
+        )
+
+    if total_rows != STATS["lexical_rows_total"] or total_fts_rows != STATS["lexical_rows_total"]:
+        raise RuntimeError(
+            "Lexical SQLite row-count mismatch: "
+            f"chunks={total_rows} fts={total_fts_rows} "
+            f"expected={STATS['lexical_rows_total']}"
+        )
+
+    print("Index sync check: OK")
     print("=" * 100)
 
 
