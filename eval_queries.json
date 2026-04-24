@@ -3,117 +3,117 @@
     "id": "blind_spot_warning_implications",
     "query": "What are the likely warning-related and safety-relevant implications of blind spot pedestrian detection in this corpus?",
     "top_k": 5,
-    "expected_files_all": [
-      "LUIS_F-18_EDGE-AI-00126-EN.pdf.txt",
-      "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt"
+    "expected_sources_all": [
+      "edge_ai_product",
+      "commercial_vehicle_safety_regulation_whitepaper"
     ],
-    "expected_files_any": [
-      "AI_Model_Customer_Verification_Report_Presentation_250927_260205.pdf.txt"
+    "expected_sources_any": [
+      "ai_model_verification_report"
     ],
     "expected_selected_chunks_any": [
       {
-        "file": "LUIS_F-18_EDGE-AI-00126-EN.pdf.txt",
+        "source": "edge_ai_product",
         "chunks": [0, 1]
       },
       {
-        "file": "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt",
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
         "chunks": [10, 28, 32]
       }
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt",
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
         "chunks": [10, 28, 29, 32]
       },
       {
-        "file": "AI_Model_Customer_Verification_Report_Presentation_250927_260205.pdf.txt",
+        "source": "ai_model_verification_report",
         "chunks": [5, 6]
       }
     ],
-    "forbidden_files": [],
-    "notes": "General warning/safety query should retrieve product warning behavior, BSIS/R151 context, and preferably FP/ODD verification evidence."
+    "forbidden_sources": [],
+    "notes": "General warning/safety query should retrieve product warning behavior, BSIS/R151 context, and preferably FP/ODD verification evidence. Source aliases are resolved through eval_source_map.local.json."
   },
   {
     "id": "three_stage_warning_logic",
     "query": "three-stage warning yellow red alarm tone CAN GPIO blind spot VRU",
     "top_k": 5,
-    "expected_files_all": [
-      "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt"
+    "expected_sources_all": [
+      "commercial_vehicle_safety_regulation_whitepaper"
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt",
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
         "chunks": [28, 29, 32]
       }
     ],
-    "forbidden_files": [],
+    "forbidden_sources": [],
     "notes": "Should hit the source that explicitly mentions yellow/red/red+alarm tone and CAN/GPIO interfaces."
   },
   {
     "id": "degraded_detection_shutdown",
     "query": "automatic shutdown reliable detection no longer guaranteed contamination lighting conditions",
     "top_k": 5,
-    "expected_files_all": [
-      "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt"
+    "expected_sources_all": [
+      "commercial_vehicle_safety_regulation_whitepaper"
+    ],
+    "expected_sources_any": [
+      "edge_ai_product"
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "LUIS_Whitepaper01_Regulierung-GSR_EN.pdf.txt",
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
         "chunks": [29]
       }
     ],
-    "expected_files_any": [
-      "LUIS_F-18_EDGE-AI-00126-EN.pdf.txt"
-    ],
-    "forbidden_files": [],
+    "forbidden_sources": [],
     "notes": "Should retrieve degraded-mode/shutdown evidence, ideally with neighboring system requirement chunk."
   },
   {
     "id": "false_positive_mitigation_odd_testing",
     "query": "false positive mitigation hard negative mining ODD generated images low light person detection",
     "top_k": 5,
-    "expected_files_all": [
-      "AI_Model_Customer_Verification_Report_Presentation_250927_260205.pdf.txt"
+    "expected_sources_all": [
+      "ai_model_verification_report"
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "AI_Model_Customer_Verification_Report_Presentation_250927_260205.pdf.txt",
+        "source": "ai_model_verification_report",
         "chunks": [5, 6]
       }
     ],
-    "forbidden_files": [],
+    "forbidden_sources": [],
     "notes": "Should retrieve verification report evidence about low light, hard negative mining, VLM-generated ODD images, and FP mitigation."
   },
   {
     "id": "embedded_edge_deployment",
     "query": "embedded edge deployment no cloud inference Rockchip NPU RKNN runtime model rollout rollback",
     "top_k": 5,
-    "expected_files_all": [
-      "AI Model Deployment.pdf.txt"
+    "expected_sources_all": [
+      "ai_model_deployment_handbook"
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "AI Model Deployment.pdf.txt",
+        "source": "ai_model_deployment_handbook",
         "chunks": [4, 5, 6]
       }
     ],
-    "forbidden_files": [],
+    "forbidden_sources": [],
     "notes": "Should retrieve deployment architecture and runtime/integration evidence."
   },
   {
     "id": "requirements_validation_latency",
     "query": "requirements test cases latency validation pedestrians real-time video frames success criteria KPIs",
     "top_k": 5,
-    "expected_files_all": [
-      "Requirements and Optimizations.pdf.txt"
+    "expected_sources_all": [
+      "requirements_optimization_handbook"
     ],
     "expected_expanded_chunks_any": [
       {
-        "file": "Requirements and Optimizations.pdf.txt",
+        "source": "requirements_optimization_handbook",
         "chunks": [11, 12, 13]
       }
     ],
-    "forbidden_files": [],
+    "forbidden_sources": [],
     "notes": "Should retrieve requirements/test-case evidence around latency, pedestrian detection, KPIs, and validation."
   }
 ]

@@ -1,0 +1,7 @@
+{
+  "edge_ai_product": "<real local file name for the edge AI product/spec source>",
+  "commercial_vehicle_safety_regulation_whitepaper": "<real local file name for the regulation/whitepaper source>",
+  "ai_model_verification_report": "<real local file name for the model verification report source>",
+  "ai_model_deployment_handbook": "<real local file name for the deployment handbook source>",
+  "requirements_optimization_handbook": "<real local file name for the requirements/optimization handbook source>"
+}

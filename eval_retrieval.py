@@ -1,727 +1,267 @@
+#!/usr/bin/env python3
+"""
+Retrieval-only eval for the local Domain Delivery RAG.
+
+This is intentionally NOT an answer-quality eval. It checks whether the shared
+retrieval/context path can find expected source files/chunks and avoids forbidden
+or dropped chunks.
+
+This script uses rag_core.py, the same retrieval and context-packing contract as
+rag_proxy.py and search.py.
+
+Public-safe eval files
+----------------------
+`eval_queries.json` should not need to contain real/private file names. Prefer
+logical source aliases:
+
+  {
+    "id": "case_id",
+    "query": "...",
+    "expected_sources_all": ["edge_ai_product"],
+    "expected_sources_any": ["ai_model_verification_report"],
+    "expected_expanded_chunks_any": [
+      {"source": "edge_ai_product", "chunks": [0, 1]}
+    ]
+  }
+
+Aliases are resolved through a local, untracked source map:
+
+  RAG_EVAL_SOURCE_MAP=~/rag_v1/eval_source_map.local.json
+
+The source map contains the real file names and should not be committed. Direct
+file-name expectations are still supported for local/private use, but aliases are
+the recommended review/public format.
+
+Usage:
+  python3 eval_retrieval.py
+  python3 eval_retrieval.py blind_spot_warning_implications
+"""
+
+from __future__ import annotations
+
 import json
 import os
-import re
 import sys
 from pathlib import Path
+from typing import Any
 
-import requests
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
+import rag_core as rc
 
-# =============================================================================
-# Domain Delivery RAG - Retrieval-only Eval
-# =============================================================================
-#
-# Purpose:
-#   Automated regression checks for retrieval quality.
-#
-# Where it fits:
-#   python3 ingest.py
-#   python3 eval_retrieval.py
-#   python3 ask_qwen.py "..."
-#
-# This script does NOT call the chat model.
-# It only verifies that retrieval finds expected source files/chunks.
-#
-# It mirrors ask_qwen.py retrieval:
-#   query -> embedding -> Qdrant vector search
-#   -> bounded heuristic metadata reranking
-#   -> file diversity
-#   -> neighbor expansion
-#
-# Eval checks:
-#   - expected files selected/expanded
-#   - expected chunks selected/expanded
-#   - forbidden files/chunks absent
-#   - drop chunks absent
-#
-# Exit code:
-#   0 = all eval cases pass
-#   1 = at least one eval case fails
-# =============================================================================
+EVAL_FILE = os.environ.get("RAG_EVAL_FILE", os.path.expanduser("~/rag_v1/eval_queries.json"))
+SOURCE_MAP_FILE = os.environ.get("RAG_EVAL_SOURCE_MAP", os.path.expanduser("~/rag_v1/eval_source_map.local.json"))
+DEFAULT_TOP_K = int(os.environ.get("RAG_EVAL_TOP_K", str(rc.DEFAULT_TOP_K)))
+DEFAULT_PRE_K = int(os.environ.get("RAG_EVAL_PRE_K", str(rc.DEFAULT_PRE_K)))
+DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(rc.DEFAULT_MAX_PER_FILE)))
+DEFAULT_NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", str(rc.DEFAULT_NEIGHBOR_RADIUS)))
 
 
-EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
-QDRANT_URL = os.environ.get("RAG_QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.environ.get("RAG_COLLECTION", "rag_v1_chunks")
-
-EVAL_FILE = os.environ.get(
-    "RAG_EVAL_FILE",
-    os.path.expanduser("~/rag_v1/eval_queries.json"),
-)
-
-DEFAULT_TOP_K = int(os.environ.get("RAG_ASK_TOP_K", "4"))
-DEFAULT_PRE_K = int(os.environ.get("RAG_ASK_PRE_K", "24"))
-MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", "2"))
-NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", "1"))
-
-VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
-DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
+def base_name(path_or_name: str) -> str:
+    return os.path.basename(path_or_name or "")
 
 
-# =============================================================================
-# Basic logging
-# =============================================================================
+def load_source_map() -> dict[str, str]:
+    """Load optional alias -> real file name map.
 
-def log(msg: str):
-    if VERBOSE:
-        print(msg, flush=True)
-
-
-def debug_print(title, value):
-    if DEBUG:
-        print("=" * 100)
-        print(f"DEBUG: {title}")
-        print("=" * 100)
-        if isinstance(value, (dict, list)):
-            print(json.dumps(value, indent=2, ensure_ascii=False)[:30000])
-        else:
-            print(str(value)[:30000])
-        print()
-
-
-# =============================================================================
-# Embedding
-# =============================================================================
-
-def embed(text: str):
-    r = requests.post(EMBED_URL, json={"input": text}, timeout=120)
-    r.raise_for_status()
-    return r.json()["data"][0]["embedding"]
-
-
-# =============================================================================
-# Query profiling and bounded heuristic metadata reranking
-# Keep this in sync with ask_qwen.py/search.py.
-# =============================================================================
-
-def tokenize_query(query: str):
-    tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9_#+.-]{3,}", query.lower())
-    stop = {
-        "the", "and", "for", "with", "from", "into", "what", "does", "this",
-        "that", "are", "how", "why", "when", "where", "which", "about",
-        "likely", "implications", "context", "corpus",
-        "что", "как", "для", "или", "это", "про", "при", "над", "под",
-    }
-    return [t for t in tokens if t not in stop]
-
-
-def query_profile(query: str):
-    q = query.lower()
-    tokens = set(tokenize_query(query))
-
-    profile = {
-        "roles": set(),
-        "facets": set(),
-        "layers": set(),
-        "stages": set(),
-        "flags": set(),
-    }
-
-    def has_any(words):
-        return any(w in q for w in words) or any(w in tokens for w in words)
-
-    if has_any(["warning", "alert", "alarm", "hmi", "driver", "stage", "stages", "yellow", "red"]):
-        profile["facets"].update({"system_behavior", "interface", "constraints"})
-        profile["layers"].update({"hmi", "decision_logic", "vehicle_integration"})
-        profile["flags"].add("has_behavioral_requirements")
-
-    if has_any(["blind spot", "pedestrian", "cyclist", "vru", "detection", "perception", "person"]):
-        profile["facets"].update({"system_behavior", "performance", "constraints"})
-        profile["layers"].update({"perception", "sensor", "decision_logic"})
-
-    if has_any([
-        "false positive", "false positives", "false negative", "false negatives",
-        "fp", "fn", "validation", "verification", "test", "tests", "scenario", "scenarios"
-    ]):
-        profile["roles"].update({"validation", "test"})
-        profile["facets"].update({"validation", "test_scenarios", "performance", "failure_modes"})
-        profile["stages"].add("verification")
-        profile["flags"].add("has_validation_or_test_evidence")
-
-    if has_any([
-        "degraded", "fallback", "shutdown", "failure", "contamination",
-        "blocked", "lighting", "unavailable", "fault"
-    ]):
-        profile["facets"].update({"failure_modes", "system_behavior", "constraints"})
-        profile["layers"].update({"sensor", "decision_logic", "hmi"})
-        profile["flags"].add("has_failure_or_degraded_mode")
-
-    if has_any(["interface", "can", "gpio", "api", "contract", "integration", "signal"]):
-        profile["roles"].add("interface_contract")
-        profile["facets"].update({"interface", "configuration", "implementation"})
-        profile["layers"].update({"vehicle_integration", "embedded_runtime", "hmi"})
-        profile["flags"].add("has_interface_or_contract")
-
-    if has_any([
-        "deploy", "deployment", "runtime", "embedded", "edge",
-        "latency", "performance", "quantized", "int8"
-    ]):
-        profile["roles"].add("deployment")
-        profile["facets"].update({"deployment", "performance", "implementation", "constraints"})
-        profile["layers"].update({"embedded_runtime", "perception"})
-        profile["stages"].update({"implementation", "release"})
-
-    if has_any([
-        "regulation", "regulatory", "compliance", "standard", "standards",
-        "certification", "approval", "ece", "gsr", "iso"
-    ]):
-        profile["roles"].add("regulation")
-        profile["facets"].update({"regulatory", "constraints"})
-        profile["layers"].add("compliance")
-        profile["stages"].update({"verification", "release"})
-        profile["flags"].add("has_regulatory_or_compliance")
-
-    if has_any(["data", "annotation", "training", "dataset", "augmentation", "label", "labels"]):
-        profile["roles"].add("data_management")
-        profile["facets"].update({"data", "implementation", "examples"})
-        profile["layers"].add("data_pipeline")
-        profile["stages"].update({"implementation", "verification"})
-
-    return profile
-
-
-def pretty_profile(profile: dict):
-    return {
-        "roles": sorted(profile["roles"]),
-        "facets": sorted(profile["facets"]),
-        "layers": sorted(profile["layers"]),
-        "stages": sorted(profile["stages"]),
-        "flags": sorted(profile["flags"]),
-    }
-
-
-def intersect_count(payload_value, wanted: set):
-    if not wanted:
-        return 0
-
-    if isinstance(payload_value, list):
-        return len(set(payload_value) & wanted)
-
-    if isinstance(payload_value, str):
-        return 1 if payload_value in wanted else 0
-
-    return 0
-
-
-def clamp(x: float, lo: float, hi: float):
-    return max(lo, min(hi, x))
-
-
-def metadata_prior(payload: dict, query: str = "") -> float:
+    This keeps eval_queries.json public-safe while allowing local validation
+    against the actual Qdrant payload file_name values.
     """
-    Bounded heuristic metadata reranking.
-
-    Same scoring as ask_qwen.py/search.py.
-    Clamp range: [-0.045, +0.050].
-    """
-    bonus = 0.0
-
-    corpus_decision = payload.get("corpus_decision")
-    delivery_value = payload.get("delivery_value")
-    safety_relevance = payload.get("safety_relevance")
-    chunk_role = payload.get("chunk_role")
-    confidence = payload.get("confidence") or 0.0
-
-    if corpus_decision == "primary":
-        bonus += 0.005
-    elif corpus_decision == "drop":
-        bonus -= 0.040
-
-    if delivery_value == "high":
-        bonus += 0.005
-    elif delivery_value == "medium":
-        bonus += 0.002
-    elif delivery_value == "low":
-        bonus -= 0.002
-
-    if safety_relevance == "high":
-        bonus += 0.004
-    elif safety_relevance == "medium":
-        bonus += 0.001
-
-    if chunk_role == "noise":
-        bonus -= 0.040
-    elif chunk_role == "unknown":
-        bonus -= 0.010
-
-    try:
-        bonus += min(float(confidence), 1.0) * 0.0025
-    except Exception:
-        pass
-
-    profile = query_profile(query)
-
-    role_hits = intersect_count(payload.get("chunk_role"), profile["roles"])
-    facet_hits = intersect_count(payload.get("content_facets"), profile["facets"])
-    layer_hits = intersect_count(payload.get("system_layers"), profile["layers"])
-    stage_hits = intersect_count(payload.get("workflow_stages"), profile["stages"])
-
-    bonus += min(role_hits * 0.005, 0.008)
-    bonus += min(facet_hits * 0.004, 0.016)
-    bonus += min(layer_hits * 0.003, 0.009)
-    bonus += min(stage_hits * 0.002, 0.006)
-
-    for flag in profile["flags"]:
-        if payload.get(flag) is True:
-            bonus += 0.005
-
-    return clamp(bonus, -0.045, 0.050)
-
-
-# =============================================================================
-# Retrieval and neighbor expansion
-# =============================================================================
-
-def retrieve(query: str, top_k: int, pre_k: int, max_per_file: int):
-    client = QdrantClient(url=QDRANT_URL)
-    qvec = embed(query)
-
-    raw = client.query_points(
-        collection_name=COLLECTION,
-        query=qvec,
-        limit=pre_k,
-        with_payload=True,
-    ).points
-
-    candidates = []
-    for point in raw:
-        payload = point.payload or {}
-        vector_score = float(point.score)
-        meta_bonus = metadata_prior(payload, query=query)
-        final_score = vector_score + meta_bonus
-
-        candidates.append(
-            {
-                "final_score": final_score,
-                "vector_score": vector_score,
-                "meta_bonus": meta_bonus,
-                "payload": payload,
-                "is_selected_hit": True,
-            }
-        )
-
-    candidates.sort(key=lambda x: x["final_score"], reverse=True)
-
-    selected = []
-    per_file = {}
-
-    for item in candidates:
-        payload = item["payload"]
-        file_path = payload.get("file_path", "unknown")
-
-        if per_file.get(file_path, 0) >= max_per_file:
-            continue
-
-        selected.append(item)
-        per_file[file_path] = per_file.get(file_path, 0) + 1
-
-        if len(selected) >= top_k:
-            break
-
-    return selected, candidates
-
-
-def fetch_chunk_payloads_for_file(client: QdrantClient, file_path: str, indices: set):
-    if not indices:
+    path = Path(SOURCE_MAP_FILE).expanduser()
+    if not path.exists():
         return {}
 
-    min_idx = min(indices)
-    max_idx = max(indices)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"Source map must be a JSON object: {path}")
+
     out = {}
-
-    offset = None
-    while True:
-        records, offset = client.scroll(
-            collection_name=COLLECTION,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="file_path",
-                        match=models.MatchValue(value=file_path),
-                    ),
-                    models.FieldCondition(
-                        key="chunk_index",
-                        range=models.Range(gte=min_idx, lte=max_idx),
-                    ),
-                ]
-            ),
-            limit=max(64, max_idx - min_idx + 1),
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-
-        for rec in records:
-            payload = rec.payload or {}
-            idx = payload.get("chunk_index")
-            if idx in indices:
-                out[idx] = payload
-
-        if offset is None:
-            break
-
+    for alias, file_name in data.items():
+        if not isinstance(alias, str) or not isinstance(file_name, str):
+            raise SystemExit(f"Invalid source map entry in {path}: {alias!r} -> {file_name!r}")
+        out[alias] = file_name
     return out
 
 
-def expand_results_with_neighbors(results, radius: int):
-    if radius <= 0:
-        groups = []
-        for rank, item in enumerate(results, start=1):
-            p = item["payload"]
-            groups.append(
-                {
-                    "group_rank": rank,
-                    "file_path": p.get("file_path", "unknown"),
-                    "file_name": p.get("file_name", "unknown"),
-                    "selected_indices": [p.get("chunk_index")],
-                    "expanded_indices": [p.get("chunk_index")],
-                    "best_final_score": item.get("final_score"),
-                    "chunks": [item],
-                }
-            )
-        return groups
+def resolve_source_name(value: str, source_map: dict[str, str]) -> str:
+    """Resolve an alias to a real file name; fall back to direct file name.
 
-    client = QdrantClient(url=QDRANT_URL)
+    If eval_queries.json uses aliases, missing aliases should fail loudly instead
+    of silently treating the alias as a real file name. Direct filenames remain
+    supported for private/local eval files.
+    """
+    if value in source_map:
+        return source_map[value]
 
-    requested_by_file = {}
-    selected_by_file = {}
-    best_rank_by_file = {}
-    best_score_by_file = {}
-    selected_lookup = {}
+    # Heuristic: values with common file suffixes are direct file names.
+    if value.endswith((".txt", ".pdf", ".md", ".docx", ".pptx")):
+        return value
 
-    for rank, item in enumerate(results, start=1):
-        p = item["payload"]
-        file_path = p.get("file_path", "unknown")
-        chunk_index = p.get("chunk_index")
-
-        if not isinstance(chunk_index, int):
-            continue
-
-        requested_by_file.setdefault(file_path, set())
-        selected_by_file.setdefault(file_path, set())
-
-        selected_by_file[file_path].add(chunk_index)
-        selected_lookup[(file_path, chunk_index)] = item
-
-        if file_path not in best_rank_by_file:
-            best_rank_by_file[file_path] = rank
-            best_score_by_file[file_path] = item.get("final_score")
-        else:
-            if item.get("final_score", 0.0) > (best_score_by_file.get(file_path) or 0.0):
-                best_score_by_file[file_path] = item.get("final_score")
-
-        for idx in range(chunk_index - radius, chunk_index + radius + 1):
-            if idx >= 0:
-                requested_by_file[file_path].add(idx)
-
-    groups = []
-    file_order = sorted(requested_by_file.keys(), key=lambda fp: best_rank_by_file.get(fp, 999999))
-
-    for group_rank, file_path in enumerate(file_order, start=1):
-        requested_indices = requested_by_file[file_path]
-        neighbor_payloads = fetch_chunk_payloads_for_file(
-            client,
-            file_path=file_path,
-            indices=requested_indices,
-        )
-
-        chunks = []
-        for idx in sorted(requested_indices):
-            key = (file_path, idx)
-
-            if key in selected_lookup:
-                item = dict(selected_lookup[key])
-                item["is_selected_hit"] = True
-            else:
-                payload = neighbor_payloads.get(idx)
-                if payload is None:
-                    continue
-
-                item = {
-                    "final_score": None,
-                    "vector_score": None,
-                    "meta_bonus": None,
-                    "payload": payload,
-                    "is_selected_hit": False,
-                }
-
-            chunks.append(item)
-
-        if not chunks:
-            continue
-
-        first_payload = chunks[0]["payload"]
-        expanded_indices = [
-            c["payload"].get("chunk_index")
-            for c in chunks
-            if isinstance(c["payload"].get("chunk_index"), int)
-        ]
-
-        groups.append(
-            {
-                "group_rank": group_rank,
-                "file_path": file_path,
-                "file_name": first_payload.get("file_name", "unknown"),
-                "selected_indices": sorted(selected_by_file.get(file_path, set())),
-                "expanded_indices": sorted(expanded_indices),
-                "best_final_score": best_score_by_file.get(file_path),
-                "chunks": chunks,
-            }
-        )
-
-    return groups
-
-
-# =============================================================================
-# Eval helpers
-# =============================================================================
-
-def load_eval_cases(path: str):
-    p = Path(path)
-    if not p.exists():
-        raise SystemExit(
-            f"Eval file not found: {path}\n"
-            f"Create ~/rag_v1/eval_queries.json first."
-        )
-
-    with p.open("r", encoding="utf-8") as f:
-        cases = json.load(f)
-
-    if not isinstance(cases, list):
-        raise SystemExit("eval_queries.json must contain a JSON list")
-
-    return cases
-
-
-def file_name_from_payload(payload: dict):
-    return payload.get("file_name") or os.path.basename(payload.get("file_path", ""))
-
-
-def selected_file_set(results):
-    return {file_name_from_payload(item["payload"]) for item in results}
-
-
-def expanded_file_set(groups):
-    out = set()
-    for group in groups:
-        for item in group["chunks"]:
-            out.add(file_name_from_payload(item["payload"]))
-    return out
-
-
-def selected_chunk_set(results):
-    out = set()
-    for item in results:
-        p = item["payload"]
-        out.add((file_name_from_payload(p), p.get("chunk_index")))
-    return out
-
-
-def expanded_chunk_set(groups):
-    out = set()
-    for group in groups:
-        for item in group["chunks"]:
-            p = item["payload"]
-            out.add((file_name_from_payload(p), p.get("chunk_index")))
-    return out
-
-
-def has_any_chunk(chunk_set: set, spec: dict):
-    file_name = spec["file"]
-    chunks = spec.get("chunks", [])
-    return any((file_name, c) in chunk_set for c in chunks)
-
-
-def has_all_chunks(chunk_set: set, spec: dict):
-    file_name = spec["file"]
-    chunks = spec.get("chunks", [])
-    return all((file_name, c) in chunk_set for c in chunks)
-
-
-def chunk_hits(chunk_set: set, spec: dict):
-    file_name = spec["file"]
-    chunks = spec.get("chunks", [])
-    return [c for c in chunks if (file_name, c) in chunk_set]
-
-
-def collect_drop_hits(results, groups):
-    hits = []
-
-    for item in results:
-        p = item["payload"]
-        if p.get("corpus_decision") == "drop":
-            hits.append(("selected", file_name_from_payload(p), p.get("chunk_index")))
-
-    for group in groups:
-        for item in group["chunks"]:
-            p = item["payload"]
-            if p.get("corpus_decision") == "drop":
-                hit = ("expanded", file_name_from_payload(p), p.get("chunk_index"))
-                if hit not in hits:
-                    hits.append(hit)
-
-    return hits
-
-
-def fmt_file_list(values):
-    if not values:
-        return "[]"
-    return "[" + ", ".join(sorted(values)) + "]"
-
-
-def fmt_chunk_set(values, limit=20):
-    ordered = sorted(values, key=lambda x: (x[0], -1 if x[1] is None else x[1]))
-    shown = ordered[:limit]
-    text = ", ".join(f"{f}:#{c}" for f, c in shown)
-    if len(ordered) > limit:
-        text += f", ... +{len(ordered) - limit} more"
-    return "[" + text + "]"
-
-
-def check_case(case: dict):
-    case_id = case.get("id", "unnamed")
-    query = case["query"]
-
-    top_k = int(case.get("top_k", DEFAULT_TOP_K))
-    pre_k = int(case.get("pre_k", max(DEFAULT_PRE_K, top_k * 4)))
-    max_per_file = int(case.get("max_per_file", MAX_PER_FILE))
-    neighbor_radius = int(case.get("neighbor_radius", NEIGHBOR_RADIUS))
-
-    results, candidates = retrieve(
-        query=query,
-        top_k=top_k,
-        pre_k=pre_k,
-        max_per_file=max_per_file,
+    raise SystemExit(
+        f"Unknown eval source alias {value!r}. Add it to {SOURCE_MAP_FILE}, "
+        "or use a direct local filename in the eval case."
     )
 
-    groups = expand_results_with_neighbors(results, radius=neighbor_radius)
 
-    selected_files = selected_file_set(results)
-    expanded_files = expanded_file_set(groups)
+def resolve_case_sources(case: dict[str, Any], source_map: dict[str, str]) -> dict[str, Any]:
+    """Return a copy of an eval case with aliases resolved to file names."""
+    resolved = dict(case)
 
-    selected_chunks = selected_chunk_set(results)
-    expanded_chunks = expanded_chunk_set(groups)
+    def resolve_list(alias_key: str, file_key: str) -> None:
+        values = []
+        values.extend(case.get(file_key, []) or [])
+        values.extend(case.get(alias_key, []) or [])
+        if values:
+            resolved[file_key] = [resolve_source_name(v, source_map) for v in values]
 
+    resolve_list("expected_sources_all", "expected_files_all")
+    resolve_list("expected_sources_any", "expected_files_any")
+    resolve_list("forbidden_sources", "forbidden_files")
+
+    def resolve_chunk_specs(key: str) -> None:
+        out = []
+        for spec in case.get(key, []) or []:
+            spec = dict(spec)
+            source = spec.pop("source", None)
+            file_name = spec.get("file")
+            if source is not None:
+                spec["file"] = resolve_source_name(source, source_map)
+            elif file_name is not None:
+                spec["file"] = resolve_source_name(file_name, source_map)
+            out.append(spec)
+        if out:
+            resolved[key] = out
+
+    resolve_chunk_specs("expected_selected_chunks_any")
+    resolve_chunk_specs("expected_expanded_chunks_any")
+
+    return resolved
+
+
+def file_set_from_items(items: list[dict[str, Any]]) -> set[str]:
+    return {rc.file_name(i["payload"]) for i in items}
+
+
+def chunk_refs_from_items(items: list[dict[str, Any]]) -> set[str]:
+    out = set()
+    for item in items:
+        p = item["payload"]
+        out.add(f"{rc.file_name(p)}:#{p.get('chunk_index')}")
+    return out
+
+
+def chunk_refs_from_groups(groups: list[dict[str, Any]]) -> set[str]:
+    out = set()
+    for group in groups:
+        fname = group.get("file_name", "unknown")
+        for item in group.get("chunks", []):
+            p = item["payload"]
+            out.add(f"{fname}:#{p.get('chunk_index')}")
+    return out
+
+
+def selected_items_from_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for group in groups:
+        for item in group.get("chunks", []):
+            if item.get("is_selected_hit"):
+                out.append(item)
+    return out
+
+
+def expanded_items_from_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for group in groups:
+        out.extend(group.get("chunks", []))
+    return out
+
+
+def has_any_chunk(refs: set[str], file_name: str, chunks: list[int]) -> bool:
+    fname = base_name(file_name)
+    return any(f"{fname}:#{idx}" in refs for idx in chunks)
+
+
+def validate_case(case: dict[str, Any], selected: list[dict[str, Any]], groups: list[dict[str, Any]]) -> list[str]:
     failures = []
-    warnings = []
 
-    # File checks use expanded files because neighbor expansion is part of the
-    # actual ask context. The selected-only set is still printed for debugging.
-    for file_name in case.get("expected_files_all", []):
-        if file_name not in expanded_files:
-            failures.append(f"missing expected file: {file_name}")
+    selected_files = file_set_from_items(selected)
+    expanded_items = expanded_items_from_groups(groups)
+    expanded_files = file_set_from_items(expanded_items)
+    selected_refs = chunk_refs_from_items(selected)
+    expanded_refs = chunk_refs_from_groups(groups)
 
-    expected_files_any = case.get("expected_files_any", [])
-    if expected_files_any and not any(f in expanded_files for f in expected_files_any):
-        failures.append(f"none of expected_files_any found: {expected_files_any}")
+    for fname in case.get("expected_files_all", []):
+        if base_name(fname) not in expanded_files:
+            failures.append(f"missing expected file: {fname}")
 
-    for file_name in case.get("forbidden_files", []):
-        if file_name in expanded_files:
-            failures.append(f"forbidden file retrieved: {file_name}")
+    any_files = [base_name(x) for x in case.get("expected_files_any", [])]
+    if any_files and not any(fname in expanded_files for fname in any_files):
+        failures.append(f"none of expected_files_any found: {case.get('expected_files_any')}")
 
-    # Chunk checks.
+    for fname in case.get("forbidden_files", []):
+        if base_name(fname) in expanded_files:
+            failures.append(f"forbidden file retrieved: {fname}")
+
     for spec in case.get("expected_selected_chunks_any", []):
-        if not has_any_chunk(selected_chunks, spec):
-            failures.append(
-                f"missing any selected chunk for {spec['file']} "
-                f"expected_any={spec.get('chunks', [])}"
-            )
-
-    for spec in case.get("expected_selected_chunks_all", []):
-        if not has_all_chunks(selected_chunks, spec):
-            hits = chunk_hits(selected_chunks, spec)
-            failures.append(
-                f"missing selected chunks for {spec['file']} "
-                f"expected_all={spec.get('chunks', [])} hits={hits}"
-            )
+        fname = spec.get("file")
+        chunks = spec.get("chunks", [])
+        if fname and chunks and not has_any_chunk(selected_refs, fname, chunks):
+            failures.append(f"missing any selected chunk for {fname} expected_any={chunks}")
 
     for spec in case.get("expected_expanded_chunks_any", []):
-        if not has_any_chunk(expanded_chunks, spec):
+        fname = spec.get("file")
+        chunks = spec.get("chunks", [])
+        if fname and chunks and not has_any_chunk(expanded_refs, fname, chunks):
+            failures.append(f"missing any expanded chunk for {fname} expected_any={chunks}")
+
+    # This is an ingest policy check more than a reranker check: drop chunks should
+    # normally not be indexed at all. If they appear, either RAG_INDEX_DROPPED_CHUNKS
+    # was enabled or the collection is stale/misconfigured.
+    for item in expanded_items:
+        p = item["payload"]
+        if p.get("corpus_decision") == "drop":
             failures.append(
-                f"missing any expanded chunk for {spec['file']} "
-                f"expected_any={spec.get('chunks', [])}"
+                f"drop chunk retrieved: {rc.file_name(p)}:#{p.get('chunk_index')} "
+                "(drop means exclude from index by default)"
             )
 
-    for spec in case.get("expected_expanded_chunks_all", []):
-        if not has_all_chunks(expanded_chunks, spec):
-            hits = chunk_hits(expanded_chunks, spec)
-            failures.append(
-                f"missing expanded chunks for {spec['file']} "
-                f"expected_all={spec.get('chunks', [])} hits={hits}"
-            )
-
-    for spec in case.get("forbidden_chunks", []):
-        file_name = spec["file"]
-        for chunk_index in spec.get("chunks", []):
-            if (file_name, chunk_index) in expanded_chunks:
-                failures.append(f"forbidden chunk retrieved: {file_name}#{chunk_index}")
-
-    drop_hits = collect_drop_hits(results, groups)
-    if drop_hits:
-        failures.append(f"drop chunks retrieved despite default policy: {drop_hits}")
-
-    min_selected = int(case.get("min_selected_results", 1))
-    if len(results) < min_selected:
-        failures.append(f"selected results below minimum: {len(results)} < {min_selected}")
-
-    min_groups = int(case.get("min_source_groups", 1))
-    if len(groups) < min_groups:
-        failures.append(f"source groups below minimum: {len(groups)} < {min_groups}")
-
-    passed = not failures
-
-    return {
-        "id": case_id,
-        "query": query,
-        "passed": passed,
-        "failures": failures,
-        "warnings": warnings,
-        "results": results,
-        "candidates": candidates,
-        "groups": groups,
-        "selected_files": selected_files,
-        "expanded_files": expanded_files,
-        "selected_chunks": selected_chunks,
-        "expanded_chunks": expanded_chunks,
-        "top_k": top_k,
-        "pre_k": pre_k,
-        "max_per_file": max_per_file,
-        "neighbor_radius": neighbor_radius,
-        "notes": case.get("notes", ""),
-    }
+    return failures
 
 
-def print_case_report(report: dict):
-    status = "PASS" if report["passed"] else "FAIL"
-
+def print_case_result(case: dict[str, Any], selected: list[dict[str, Any]], groups: list[dict[str, Any]], failures: list[str]):
+    status = "PASS" if not failures else "FAIL"
     print("=" * 100)
-    print(f"{status}: {report['id']}")
+    print(f"{status}: {case['id']}")
     print("=" * 100)
-    print(f"Query: {report['query']}")
+    print(f"Query: {case['query']}")
     print(
-        f"top_k={report['top_k']}; pre_k={report['pre_k']}; "
-        f"max_per_file={report['max_per_file']}; "
-        f"neighbor_radius={report['neighbor_radius']}"
+        f"top_k={case.get('top_k', DEFAULT_TOP_K)}; "
+        f"pre_k={case.get('pre_k', DEFAULT_PRE_K)}; "
+        f"max_per_file={case.get('max_per_file', DEFAULT_MAX_PER_FILE)}; "
+        f"neighbor_radius={case.get('neighbor_radius', DEFAULT_NEIGHBOR_RADIUS)}"
     )
-    if report["notes"]:
-        print(f"Notes: {report['notes']}")
+    if case.get("notes"):
+        print(f"Notes: {case['notes']}")
     print()
 
-    print(f"Selected files: {fmt_file_list(report['selected_files'])}")
-    print(f"Expanded files: {fmt_file_list(report['expanded_files'])}")
-    print(f"Selected chunks: {fmt_chunk_set(report['selected_chunks'])}")
-    print(f"Expanded chunks: {fmt_chunk_set(report['expanded_chunks'])}")
+    selected_refs = sorted(chunk_refs_from_items(selected))
+    expanded_refs = sorted(chunk_refs_from_groups(groups))
+    selected_files = sorted(file_set_from_items(selected))
+    expanded_files = sorted(file_set_from_items(expanded_items_from_groups(groups)))
+
+    print(f"Selected files: [{', '.join(selected_files)}]")
+    print(f"Expanded files: [{', '.join(expanded_files)}]")
+    print(f"Selected chunks: [{', '.join(selected_refs)}]")
+    print(f"Expanded chunks: [{', '.join(expanded_refs)}]")
     print()
 
     print("Selected results:")
-    for rank, item in enumerate(report["results"], start=1):
+    for rank, item in enumerate(selected, start=1):
         p = item["payload"]
         print(
-            f"  {rank}. final={item['final_score']:.4f} "
-            f"vector={item['vector_score']:.4f} "
-            f"meta={item['meta_bonus']:+.4f} "
-            f"file={file_name_from_payload(p)} "
+            f"  {rank}. "
+            f"final={rc.fmt_score(item.get('final_score'))} "
+            f"vector={rc.fmt_score(item.get('vector_score'))} "
+            f"meta={rc.fmt_score(item.get('meta_bonus'))} "
+            f"file={rc.file_name(p)} "
             f"chunk={p.get('chunk_index')} "
             f"role={p.get('chunk_role')} "
             f"facets={p.get('content_facets')} "
@@ -729,88 +269,104 @@ def print_case_report(report: dict):
             f"delivery={p.get('delivery_value')} "
             f"decision={p.get('corpus_decision')}"
         )
-
     print()
 
-    if report["groups"]:
-        print("Source groups after neighbor expansion:")
-        for idx, group in enumerate(report["groups"], start=1):
-            print(
-                f"  S{idx}. file={group.get('file_name')} "
-                f"selected={group.get('selected_indices')} "
-                f"expanded={group.get('expanded_indices')} "
-                f"best_final={group.get('best_final_score'):.4f}"
-                if group.get("best_final_score") is not None
-                else f"  S{idx}. file={group.get('file_name')} "
-                     f"selected={group.get('selected_indices')} "
-                     f"expanded={group.get('expanded_indices')}"
-            )
-
+    print("Source groups after neighbor expansion:")
+    for i, group in enumerate(groups, start=1):
+        print(
+            f"  S{i}. file={group.get('file_name')} "
+            f"selected={group.get('selected_indices')} "
+            f"expanded={group.get('expanded_indices')} "
+            f"best_final={rc.fmt_score(group.get('best_final_score'))}"
+        )
     print()
 
-    if report["failures"]:
+    if failures:
         print("Failures:")
-        for failure in report["failures"]:
-            print(f"  - {failure}")
+        for f in failures:
+            print(f"  - {f}")
         print()
 
-    if report["warnings"]:
-        print("Warnings:")
-        for warning in report["warnings"]:
-            print(f"  - {warning}")
-        print()
+
+def load_cases() -> list[dict[str, Any]]:
+    path = Path(EVAL_FILE)
+    if not path.exists():
+        raise SystemExit(f"Eval file not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise SystemExit("eval_queries.json must contain a JSON list")
+    return data
 
 
 def main():
     only_id = sys.argv[1] if len(sys.argv) > 1 else None
-
-    print("=" * 100)
-    print("RAG RETRIEVAL EVAL START")
-    print("=" * 100)
-    print(f"Eval file: {EVAL_FILE}")
-    print(f"Collection: {COLLECTION}")
-    print(f"Qdrant URL: {QDRANT_URL}")
-    print(f"Embedding URL: {EMBED_URL}")
-    print(f"Defaults: top_k={DEFAULT_TOP_K}; pre_k={DEFAULT_PRE_K}; max_per_file={MAX_PER_FILE}; neighbor_radius={NEIGHBOR_RADIUS}")
-    print(f"metadata_rerank_clamp=[-0.045,+0.050]")
-    print(f"Verbose: {VERBOSE}; Debug raw payloads: {DEBUG}")
-    if only_id:
-        print(f"Filter case id: {only_id}")
-    print()
-
-    cases = load_eval_cases(EVAL_FILE)
-
+    source_map = load_source_map()
+    cases = load_cases()
     if only_id:
         cases = [c for c in cases if c.get("id") == only_id]
         if not cases:
-            raise SystemExit(f"No eval case found with id: {only_id}")
+            raise SystemExit(f"No eval case with id={only_id!r}")
 
-    reports = []
+    cases = [resolve_case_sources(case, source_map) for case in cases]
+
+    cfg = rc.retrieval_config_summary()
+    print("=" * 100)
+    print("RAG RETRIEVAL-ONLY EVAL START")
+    print("=" * 100)
+    print(f"Eval file: {EVAL_FILE}")
+    print(f"Source map: {SOURCE_MAP_FILE} ({'loaded' if source_map else 'not loaded'})")
+    print(f"Retrieval mode: {cfg['mode']} (hybrid {cfg['hybrid']})")
+    print(f"Collection: {cfg['collection']}")
+    print(f"Qdrant URL: {cfg['qdrant_url']}")
+    print(f"Embedding URL: {cfg['embed_url']}")
+    print(
+        f"Defaults: top_k={DEFAULT_TOP_K}; pre_k={DEFAULT_PRE_K}; "
+        f"max_per_file={DEFAULT_MAX_PER_FILE}; neighbor_radius={DEFAULT_NEIGHBOR_RADIUS}"
+    )
+    print(f"metadata_rerank_clamp={cfg['metadata_rerank_clamp']}")
+    print("Eval scope: retrieval only; answer faithfulness and proxy/e2e eval are deferred.")
+    print()
+
+    passed = 0
+    failed = 0
+    failed_ids = []
+
     for case in cases:
-        report = check_case(case)
-        reports.append(report)
-        print_case_report(report)
+        top_k = int(case.get("top_k", DEFAULT_TOP_K))
+        pre_k = int(case.get("pre_k", DEFAULT_PRE_K))
+        max_per_file = int(case.get("max_per_file", DEFAULT_MAX_PER_FILE))
+        neighbor_radius = int(case.get("neighbor_radius", DEFAULT_NEIGHBOR_RADIUS))
 
-    passed = sum(1 for r in reports if r["passed"])
-    failed = len(reports) - passed
+        selected, _candidates = rc.retrieve_dense(
+            question=case["query"],
+            top_k=top_k,
+            pre_k=pre_k,
+            max_per_file=max_per_file,
+        )
+        groups = rc.expand_results_with_neighbors(selected, radius=neighbor_radius)
+        failures = validate_case(case, selected, groups)
+        print_case_result(case, selected, groups, failures)
+
+        if failures:
+            failed += 1
+            failed_ids.append(case["id"])
+        else:
+            passed += 1
 
     print("=" * 100)
-    print("RAG RETRIEVAL EVAL SUMMARY")
+    print("RAG RETRIEVAL-ONLY EVAL SUMMARY")
     print("=" * 100)
-    print(f"Cases total: {len(reports)}")
+    print(f"Cases total: {passed + failed}")
     print(f"Passed: {passed}")
     print(f"Failed: {failed}")
-
-    if failed:
-        print()
-        print("Failed case ids:")
-        for r in reports:
-            if not r["passed"]:
-                print(f"  - {r['id']}")
-
+    if failed_ids:
+        print("\nFailed case ids:")
+        for cid in failed_ids:
+            print(f"  - {cid}")
     print("=" * 100)
 
-    sys.exit(1 if failed else 0)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
