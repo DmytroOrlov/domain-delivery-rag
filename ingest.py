@@ -10,7 +10,13 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
 # =============================================================================
-# Domain Delivery RAG - Ingestion Pipeline
+# ADAS / Embedded Vision Delivery RAG - Ingestion Pipeline
+# =============================================================================
+#
+# This is a local v1 pipeline for safety-relevant embedded vision / ADAS-style
+# corpora. It is not a generic production RAG framework yet. Domain-specific
+# ontology and metadata are intentionally kept explicit so they can be reviewed,
+# measured, and later moved into configuration if the project becomes multi-domain.
 # =============================================================================
 #
 # Flow:
@@ -46,7 +52,10 @@ CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "1400"))
 OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "250"))
 
 METADATA_TARGET_BATCH_SIZE = int(os.environ.get("RAG_METADATA_TARGET_BATCH_SIZE", "10"))
-METADATA_MAX_REQUESTS_PER_FILE = int(os.environ.get("RAG_METADATA_MAX_REQUESTS_PER_FILE", "3"))
+# Target number of initial LLM metadata batches per file.
+# This is NOT a hard request cap: large files may require more batches to respect
+# METADATA_MAX_BATCH_SIZE. Retry splits can also increase the actual request count.
+METADATA_TARGET_MAX_INITIAL_BATCHES = int(os.environ.get("RAG_METADATA_TARGET_MAX_INITIAL_BATCHES", "3"))
 METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "30"))
 
 # Default: do NOT index chunks classified as drop.
@@ -642,7 +651,7 @@ def item_to_metadata(item):
 def make_balanced_batches(
         chunks,
         target_batch_size: int,
-        max_requests: int,
+        target_max_initial_batches: int,
         max_batch_size: int,
 ):
     n = len(chunks)
@@ -650,7 +659,7 @@ def make_balanced_batches(
         return []
 
     target_batch_size = max(1, int(target_batch_size))
-    max_requests = max(1, int(max_requests))
+    target_max_initial_batches = max(1, int(target_max_initial_batches))
     max_batch_size = max(1, int(max_batch_size))
 
     desired_by_target = (n + target_batch_size - 1) // target_batch_size
@@ -658,7 +667,7 @@ def make_balanced_batches(
 
     num_batches = max(
         desired_by_cap,
-        min(max_requests, desired_by_target),
+        min(target_max_initial_batches, desired_by_target),
     )
 
     base = n // num_batches
@@ -767,9 +776,7 @@ Chunks:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.0,
-        "top_p": 0.9,
-        "max_tokens": 12000,
+        "max_tokens": 16384,
         "response_format": {"type": "json_object"},
     }
 
@@ -1118,9 +1125,10 @@ def main():
     print(f"Files found: {len(files)}")
     print(f"Chunking: paragraph/heading-aware; chunk_size_target={CHUNK_SIZE}; overlap={OVERLAP}")
     print(
-        f"Metadata batching: target={METADATA_TARGET_BATCH_SIZE}; "
-        f"max_requests_per_file={METADATA_MAX_REQUESTS_PER_FILE}; "
-        f"max_batch_size={METADATA_MAX_BATCH_SIZE}"
+        f"Metadata batching: target_batch_size={METADATA_TARGET_BATCH_SIZE}; "
+        f"target_max_initial_batches={METADATA_TARGET_MAX_INITIAL_BATCHES}; "
+        f"hard_max_batch_size={METADATA_MAX_BATCH_SIZE}; "
+        "actual requests may exceed target for large files or retry splits"
     )
     print(f"Index dropped chunks: {INDEX_DROPPED_CHUNKS}")
     print(f"Verbose: {VERBOSE}; Debug raw payloads: {DEBUG}")
@@ -1163,7 +1171,7 @@ def main():
         batches = make_balanced_batches(
             chunks,
             target_batch_size=METADATA_TARGET_BATCH_SIZE,
-            max_requests=METADATA_MAX_REQUESTS_PER_FILE,
+            target_max_initial_batches=METADATA_TARGET_MAX_INITIAL_BATCHES,
             max_batch_size=METADATA_MAX_BATCH_SIZE,
         )
 

@@ -13,21 +13,36 @@
     "expected_selected_chunks_any": [
       {
         "source": "edge_ai_product",
-        "chunks": [0, 1]
+        "chunks": [
+          0,
+          1
+        ]
       },
       {
         "source": "commercial_vehicle_safety_regulation_whitepaper",
-        "chunks": [10, 28, 32]
+        "chunks": [
+          10,
+          28,
+          32
+        ]
       }
     ],
     "expected_expanded_chunks_any": [
       {
         "source": "commercial_vehicle_safety_regulation_whitepaper",
-        "chunks": [10, 28, 29, 32]
+        "chunks": [
+          10,
+          28,
+          29,
+          32
+        ]
       },
       {
         "source": "ai_model_verification_report",
-        "chunks": [5, 6]
+        "chunks": [
+          5,
+          6
+        ]
       }
     ],
     "forbidden_sources": [],
@@ -43,7 +58,11 @@
     "expected_expanded_chunks_any": [
       {
         "source": "commercial_vehicle_safety_regulation_whitepaper",
-        "chunks": [28, 29, 32]
+        "chunks": [
+          28,
+          29,
+          32
+        ]
       }
     ],
     "forbidden_sources": [],
@@ -56,17 +75,17 @@
     "expected_sources_all": [
       "commercial_vehicle_safety_regulation_whitepaper"
     ],
-    "expected_sources_any": [
-      "edge_ai_product"
-    ],
     "expected_expanded_chunks_any": [
       {
         "source": "commercial_vehicle_safety_regulation_whitepaper",
-        "chunks": [29]
+        "chunks": [
+          29,
+          30
+        ]
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should retrieve degraded-mode/shutdown evidence, ideally with neighboring system requirement chunk."
+    "notes": "Should retrieve degraded-mode/shutdown evidence from the regulation/whitepaper source. The edge product source may appear as useful supporting context, but is not required."
   },
   {
     "id": "false_positive_mitigation_odd_testing",
@@ -78,7 +97,10 @@
     "expected_expanded_chunks_any": [
       {
         "source": "ai_model_verification_report",
-        "chunks": [5, 6]
+        "chunks": [
+          5,
+          6
+        ]
       }
     ],
     "forbidden_sources": [],
@@ -94,7 +116,11 @@
     "expected_expanded_chunks_any": [
       {
         "source": "ai_model_deployment_handbook",
-        "chunks": [4, 5, 6]
+        "chunks": [
+          4,
+          5,
+          6
+        ]
       }
     ],
     "forbidden_sources": [],
@@ -110,10 +136,40 @@
     "expected_expanded_chunks_any": [
       {
         "source": "requirements_optimization_handbook",
-        "chunks": [11, 12, 13]
+        "chunks": [
+          11,
+          12,
+          13
+        ]
       }
     ],
     "forbidden_sources": [],
     "notes": "Should retrieve requirements/test-case evidence around latency, pedestrian detection, KPIs, and validation."
+  },
+  {
+    "id": "unknown_warning_transition_thresholds",
+    "query": "What are the exact time-to-collision, distance, object-confidence, and persistence thresholds for switching blind spot warnings from yellow to red to audible alarm?",
+    "top_k": 5,
+    "expected_answer_mode": "insufficient_evidence",
+    "required_answer_patterns": [
+      "(?i)(not specified|not provided|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown)"
+    ],
+    "forbidden_answer_patterns": [
+      "(?i)exact (time-to-collision|confidence|persistence) threshold is [0-9]"
+    ],
+    "notes": "No-answer/insufficient-evidence case. Corpus mentions multi-stage warnings, but should not invent exact transition thresholds. Retrieval expectations are intentionally omitted; answer eval checks abstention behavior."
+  },
+  {
+    "id": "unknown_safety_integrity_level",
+    "query": "What ASIL or SIL level is assigned to the blind spot pedestrian detection warning function, and what is the exact formal safety goal wording?",
+    "top_k": 5,
+    "expected_answer_mode": "insufficient_evidence",
+    "required_answer_patterns": [
+      "(?i)(not specified|not provided|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown)"
+    ],
+    "forbidden_answer_patterns": [
+      "(?i)(ASIL|SIL) *[ABCD1234].*(assigned|is|=)"
+    ],
+    "notes": "No-answer/insufficient-evidence case. Corpus may discuss safety relevance and standards, but should not invent ASIL/SIL assignment or formal safety-goal wording."
   }
 ]

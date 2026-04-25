@@ -2,6 +2,9 @@
 """
 Minimal reverse-proxy RAG UX for the stock llama.cpp browser chat.
 
+Scope: local ADAS / embedded vision delivery RAG v1. This proxy is deliberately
+narrow and does not attempt to be a general OpenAI-compatible middleware.
+
 Why this exists
 ---------------
 We want to keep llama.cpp / llama-server unpatched and still use its browser UI.

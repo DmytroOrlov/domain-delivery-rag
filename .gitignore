@@ -2,3 +2,5 @@
 /eval_source_map.local.json
 /files/
 /pdf/
+/venv/
+/.idea/

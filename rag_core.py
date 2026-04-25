@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Shared dense-retrieval core for the local Domain Delivery RAG.
+Shared dense-retrieval core for the local ADAS / Embedded Vision Delivery RAG v1.
 
-This module is the single source of truth for the v1 runtime retrieval contract:
+This module is the single source of truth for the v1 runtime retrieval contract.
+
+Scope note:
+  The current ontology and query-profile terms are intentionally domain-specific
+  to safety-relevant embedded vision / ADAS corpora. This is not a generic
+  multi-domain RAG framework yet; if the project expands, these terms should move
+  into a domain configuration file.
+
+Runtime contract:
 
     question
     -> embedding server
@@ -62,8 +70,11 @@ SELECTED_MAX_CHARS = int(os.environ.get("RAG_SELECTED_MAX_CHARS", "2200"))
 NEIGHBOR_SNIPPET_CHARS = int(os.environ.get("RAG_NEIGHBOR_SNIPPET_CHARS", "700"))
 CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", "18000"))
 
-# Bounded metadata rerank. This can reorder close candidates, but should not
-# overpower dense retrieval.
+# Bounded metadata rerank. This is a heuristic, not a learned ranker.
+# It can reorder close dense candidates; this is intentional but must remain
+# measurable. Retrieval eval currently locks the green dense+metadata baseline.
+# A future ablation pass should compare raw dense order vs dense+metadata order
+# and log rank swaps for each golden query before changing these weights.
 META_MIN = -0.045
 META_MAX = 0.050
 

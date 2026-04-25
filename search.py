@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic search for the local Domain Delivery RAG.
+Diagnostic search for the local ADAS / Embedded Vision Delivery RAG v1.
 
 This script is intentionally a thin shell around rag_core.py. It must use the
 same retrieval, neighbor expansion, and context-packing contract as rag_proxy.py

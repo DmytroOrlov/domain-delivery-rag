@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Retrieval-only eval for the local Domain Delivery RAG.
+Retrieval-only eval for the local ADAS / Embedded Vision Delivery RAG v1.
 
 This is intentionally NOT an answer-quality eval. It checks whether the shared
 retrieval/context path can find expected source files/chunks and avoids forbidden
@@ -30,7 +30,10 @@ Aliases are resolved through a local, untracked source map:
 
 The source map contains the real file names and should not be committed. Direct
 file-name expectations are still supported for local/private use, but aliases are
-the recommended review/public format.
+the recommended review/public format. Cases without expected source/chunk
+constraints are allowed for answer-only checks such as insufficient-evidence
+queries; retrieval eval then only enforces generic index hygiene such as no
+retrieved drop chunks.
 
 Usage:
   python3 eval_retrieval.py

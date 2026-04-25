@@ -16,7 +16,7 @@ import requests
 import rag_core as rc
 
 # =============================================================================
-# Domain Delivery RAG - Answer Contract Eval
+# ADAS / Embedded Vision Delivery RAG - Answer Contract Eval
 # =============================================================================
 #
 # Purpose:
@@ -27,6 +27,8 @@ import rag_core as rc
 #
 # What this eval checks:
 #   - the answer has the required six-section structure;
+#   - no-answer/insufficient-evidence cases explicitly abstain instead of
+#     inventing thresholds, ASIL/SIL assignments, or formal safety goals;
 #   - the answer cites retrieved sources as [S1], [S2], ...;
 #   - visible reasoning does not remain in the final parsed answer;
 #   - raw /rag command does not leak;
@@ -255,6 +257,17 @@ LOCAL_PATH_PATTERNS = [
     r"[A-Za-z]:\\[^ \n\t]+",
 ]
 
+INSUFFICIENT_EVIDENCE_PATTERNS = [
+    r"(?i)\bnot specified\b",
+    r"(?i)\bnot provided\b",
+    r"(?i)\bnot enough evidence\b",
+    r"(?i)\binsufficient evidence\b",
+    r"(?i)\bnot explicitly\b",
+    r"(?i)\bcannot determine\b",
+    r"(?i)\bunknown\b",
+    r"(?i)\bno retrieved evidence\b",
+]
+
 CLASSIFICATION_METADATA_LEAK_PATTERNS = [
     r"\bchunk_role\b",
     r"\bcontent_facets\b",
@@ -343,6 +356,14 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
     metadata_hits = collect_regex_hits(answer, CLASSIFICATION_METADATA_LEAK_PATTERNS)
     if metadata_hits:
         failures.append(f"classification metadata leaked into answer: {metadata_hits[:5]}")
+
+    if case.get("expected_answer_mode") == "insufficient_evidence":
+        insufficiency_hits = collect_regex_hits(answer, INSUFFICIENT_EVIDENCE_PATTERNS)
+        if not insufficiency_hits:
+            failures.append(
+                "expected insufficient-evidence behavior, but answer did not contain "
+                "an explicit uncertainty/abstention phrase"
+            )
 
     for pattern in case.get("required_answer_patterns", []):
         if not re.search(pattern, answer, flags=re.I | re.M):

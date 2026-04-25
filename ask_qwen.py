@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Debug CLI for asking the local Qwen/llama-server with the same RAG prompt used by
+Debug CLI for asking the local Qwen/llama-server with the same ADAS / embedded vision RAG prompt used by
 rag_proxy.py.
 
 Primary UX:
