@@ -646,12 +646,12 @@ def build_augmented_prompt(
     prompt = f"""You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.
 
 Use the retrieved context first.
-The retrieved context is the source of truth.
-Classification metadata is not answer evidence; use only source text as evidence.
+The retrieved chunk text is the source of truth.
+Use source ids, file names, and chunk ids only for citation/source mapping.
 Separate supported facts from inference.
 If the retrieved context does not support a claim, say so explicitly.
 Be conservative with safety-relevant claims.
-Cite sources using [S1], [S2], etc.
+Cite sources using [S1], [S2], etc.; every bullet in "Supported facts" should have a citation.
 
 Answer format:
 1. Conclusion

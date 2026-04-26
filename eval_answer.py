@@ -223,17 +223,20 @@ def call_chat(prompt: str):
 # Answer checks
 # =============================================================================
 
-# Accept plain numbered headings and common Markdown-bold variants, e.g.
+# Accept plain numbered headings and common Markdown variants, e.g.
 #   1. Conclusion
 #   1. **Conclusion**
+#   ### 1. Conclusion
 # The eval is checking the answer contract, not enforcing one exact Markdown style.
+# We still require the section number + section title, but allow optional Markdown
+# heading markers and bold markers around the title.
 REQUIRED_SECTION_PATTERNS = [
-    ("conclusion", r"(?im)^\s*1[.)]\s*(?:\*\*)?\s*conclusion\b\s*(?:\*\*)?"),
-    ("supported_facts", r"(?im)^\s*2[.)]\s*(?:\*\*)?\s*supported facts\b\s*(?:\*\*)?"),
-    ("inferences", r"(?im)^\s*3[.)]\s*(?:\*\*)?\s*inferences\b\s*(?:\*\*)?"),
-    ("implementation_implications", r"(?im)^\s*4[.)]\s*(?:\*\*)?\s*implementation implications\b\s*(?:\*\*)?"),
-    ("unknowns", r"(?im)^\s*5[.)]\s*(?:\*\*)?\s*unknowns\s*/\s*verification needed\b\s*(?:\*\*)?"),
-    ("source_mapping", r"(?im)^\s*6[.)]\s*(?:\*\*)?\s*source mapping\b\s*(?:\*\*)?"),
+    ("conclusion", r"(?im)^\s*#{0,6}\s*1[.)]\s*(?:\*\*)?\s*conclusion\b\s*(?:\*\*)?"),
+    ("supported_facts", r"(?im)^\s*#{0,6}\s*2[.)]\s*(?:\*\*)?\s*supported facts\b\s*(?:\*\*)?"),
+    ("inferences", r"(?im)^\s*#{0,6}\s*3[.)]\s*(?:\*\*)?\s*inferences\b\s*(?:\*\*)?"),
+    ("implementation_implications", r"(?im)^\s*#{0,6}\s*4[.)]\s*(?:\*\*)?\s*implementation implications\b\s*(?:\*\*)?"),
+    ("unknowns", r"(?im)^\s*#{0,6}\s*5[.)]\s*(?:\*\*)?\s*unknowns\s*/\s*verification needed\b\s*(?:\*\*)?"),
+    ("source_mapping", r"(?im)^\s*#{0,6}\s*6[.)]\s*(?:\*\*)?\s*source mapping\b\s*(?:\*\*)?"),
 ]
 
 REASONING_LEAK_PATTERNS = [
@@ -254,14 +257,27 @@ LOCAL_PATH_PATTERNS = [
 ]
 
 INSUFFICIENT_EVIDENCE_PATTERNS = [
+    # Short forms.
     r"(?i)\bnot specified\b",
     r"(?i)\bnot provided\b",
+    r"(?i)\bnot stated\b",
+    r"(?i)\bnot defined\b",
     r"(?i)\bnot enough evidence\b",
     r"(?i)\binsufficient evidence\b",
     r"(?i)\bnot explicitly\b",
     r"(?i)\bcannot determine\b",
     r"(?i)\bunknown\b",
     r"(?i)\bno retrieved evidence\b",
+
+    # Natural Qwen phrasings observed in no-answer cases.
+    r"(?i)\bdoes not provide\b",
+    r"(?i)\bdoes not specify\b",
+    r"(?i)\bdoes not state\b",
+    r"(?i)\bdoes not define\b",
+    r"(?i)\bdoes not contain\b",
+    r"(?i)\bno exact\b",
+    r"(?i)\bno explicit\b",
+    r"(?i)\bnor does it provide\b",
 ]
 
 CLASSIFICATION_METADATA_LEAK_PATTERNS = [

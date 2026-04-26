@@ -203,10 +203,11 @@
     "top_k": 5,
     "expected_answer_mode": "insufficient_evidence",
     "required_answer_patterns": [
-      "(?i)(not specified|not provided|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown)"
+      "(?i)(not specified|not provided|not stated|not defined|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown|does not provide|does not specify|does not state|does not define|does not contain|no exact|no explicit)"
     ],
     "forbidden_answer_patterns": [
-      "(?i)exact (time-to-collision|confidence|persistence) threshold is [0-9]"
+      "(?i)\\b(?:time-to-collision|TTC|distance|object-confidence|confidence|persistence)\\s*(?:threshold|value)?\\s*(?:is|=|:)\\s*[0-9]+",
+      "(?i)\\byellow\\s*(?:to|->|→)\\s*red\\s*(?:at|when|if)\\s*[0-9]+"
     ],
     "notes": "No-answer/insufficient-evidence case. Corpus mentions multi-stage warnings, but should not invent exact transition thresholds. Retrieval expectations are intentionally omitted; answer eval checks abstention behavior."
   },
@@ -216,10 +217,11 @@
     "top_k": 5,
     "expected_answer_mode": "insufficient_evidence",
     "required_answer_patterns": [
-      "(?i)(not specified|not provided|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown)"
+      "(?i)(not specified|not provided|not stated|not defined|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown|does not provide|does not specify|does not state|does not define|does not contain|no exact|no explicit)"
     ],
     "forbidden_answer_patterns": [
-      "(?i)(ASIL|SIL) *[ABCD1234].*(assigned|is|=)"
+      "(?i)\\bASIL\\s*[-:]?\\s*[ABCD]\\b",
+      "(?i)\\bSIL\\s*[-:]?\\s*[1-4]\\b"
     ],
     "notes": "No-answer/insufficient-evidence case. Corpus may discuss safety relevance and standards, but should not invent ASIL/SIL assignment or formal safety-goal wording."
   }
