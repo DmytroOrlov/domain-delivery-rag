@@ -72,11 +72,15 @@ CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", "18000"))
 
 # Bounded metadata rerank. This is a heuristic, not a learned ranker.
 # It can reorder close dense candidates; this is intentional but must remain
-# measurable. Retrieval eval currently locks the green dense+metadata baseline.
-# A future ablation pass should compare raw dense order vs dense+metadata order
-# and log rank swaps for each golden query before changing these weights.
+# measurable. `eval_metadata_ablation.py` compares raw dense retrieval against
+# dense+metadata reranking so weight changes are reviewable instead of guessed.
+#
+# RAG_METADATA_PRIOR=0 disables the heuristic globally for normal callers.
+# Ablation code can also override it per call through retrieve_dense(...,
+# use_metadata_prior=False).
 META_MIN = -0.045
 META_MAX = 0.050
+METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
@@ -332,13 +336,21 @@ def retrieve_dense(
     top_k: int = DEFAULT_TOP_K,
     pre_k: int = DEFAULT_PRE_K,
     max_per_file: int = DEFAULT_MAX_PER_FILE,
+    use_metadata_prior: bool | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Return selected candidates and all pre-diversity candidates.
 
     Ranking contract:
-      final_score = dense cosine score + bounded metadata_prior
+      dense_raw:       final_score = dense cosine score
+      dense+metadata:  final_score = dense cosine score + bounded metadata_prior
+
+    `use_metadata_prior=None` follows RAG_METADATA_PRIOR. Ablation callers pass
+    True/False explicitly so both modes can be compared in one process.
     """
+    if use_metadata_prior is None:
+        use_metadata_prior = METADATA_PRIOR_ENABLED
+
     qvec = embed(question)
     client = QdrantClient(url=QDRANT_URL)
     actual_pre_k = max(pre_k, top_k * 4)
@@ -354,7 +366,7 @@ def retrieve_dense(
     for rank, point in enumerate(raw, start=1):
         payload = point.payload or {}
         vector_score = float(point.score)
-        meta_bonus = metadata_prior(payload, query=question)
+        meta_bonus = metadata_prior(payload, query=question) if use_metadata_prior else 0.0
         final_score = vector_score + meta_bonus
         candidates.append(
             RetrievalItem(
@@ -698,6 +710,7 @@ def retrieval_config_summary() -> dict[str, Any]:
         "selected_max_chars": SELECTED_MAX_CHARS,
         "neighbor_snippet_chars": NEIGHBOR_SNIPPET_CHARS,
         "context_max_chars": CONTEXT_MAX_CHARS,
+        "metadata_prior": "enabled" if METADATA_PRIOR_ENABLED else "disabled",
         "metadata_rerank_clamp": f"[{META_MIN:+.3f},{META_MAX:+.3f}]",
         "hybrid": "disabled/deferred",
     }
