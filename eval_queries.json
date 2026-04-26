@@ -220,9 +220,266 @@
       "(?i)(not specified|not provided|not stated|not defined|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown|does not provide|does not specify|does not state|does not define|does not contain|no exact|no explicit)"
     ],
     "forbidden_answer_patterns": [
-      "(?i)\\bASIL\\s*[-:]?\\s*[ABCD]\\b",
-      "(?i)\\bSIL\\s*[-:]?\\s*[1-4]\\b"
+      "(?i)(blind spot|pedestrian detection|warning function|this function|the function).{0,120}\\bASIL\\s*[-:]?\\s*[ABCD]\\b",
+      "(?i)\\bASIL\\s*[-:]?\\s*[ABCD]\\b.{0,120}(blind spot|pedestrian detection|warning function|this function|the function)",
+      "(?i)(blind spot|pedestrian detection|warning function|this function|the function).{0,120}\\bSIL\\s*[-:]?\\s*[1-4]\\b",
+      "(?i)\\bSIL\\s*[-:]?\\s*[1-4]\\b.{0,120}(blind spot|pedestrian detection|warning function|this function|the function)"
     ],
     "notes": "No-answer/insufficient-evidence case. Corpus may discuss safety relevance and standards, but should not invent ASIL/SIL assignment or formal safety-goal wording."
+  },
+  {
+    "id": "bsis_vs_mois_scope",
+    "query": "UN ECE R151 blind spot information system versus R159 moving-off information system detection zones and regulatory scope",
+    "top_k": 5,
+    "expected_sources_all": [
+      "commercial_vehicle_safety_regulation_whitepaper"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          10,
+          24
+        ]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          9,
+          10,
+          11,
+          23,
+          24,
+          25
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "notes": "Exact regulatory distinction case. It should retrieve the commercial-vehicle regulation source around BSIS/R151 and MOIS/R159 scope, detection zones, and vehicle applicability."
+  },
+  {
+    "id": "interface_trigger_can_gpio",
+    "query": "CAN bus analog GPIO trigger output interface warning signal integration vehicle",
+    "top_k": 5,
+    "expected_sources_all": [
+      "commercial_vehicle_safety_regulation_whitepaper",
+      "edge_ai_product"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          29,
+          32
+        ]
+      },
+      {
+        "source": "edge_ai_product",
+        "chunks": [
+          1
+        ]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          28,
+          29,
+          30,
+          31,
+          32,
+          33
+        ]
+      },
+      {
+        "source": "edge_ai_product",
+        "chunks": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "notes": "Exact interface case. It should retrieve CAN/GPIO evidence from the regulation/whitepaper source and trigger-output or external-alert integration evidence from the edge product source."
+  },
+  {
+    "id": "low_light_limitation_marketing",
+    "query": "low light performance limitations noise degradation versus marketing claims working in poor visibility",
+    "top_k": 5,
+    "expected_sources_any": [
+      "ai_model_verification_report",
+      "edge_ai_product",
+      "data_management_handbook"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "ai_model_verification_report",
+        "chunks": [
+          5,
+          6
+        ]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "ai_model_verification_report",
+        "chunks": [
+          4,
+          5,
+          6
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "expected_answer_mode": "limitation",
+    "required_answer_patterns": [
+      "(?i)(low[- ]light|poor visibility|lighting conditions?|visibility)",
+      "(?i)(severe image noise|image noise|noise|noisy|degrad(?:e|es|ed|ing|ation)?|reduced contrast|blurred|limited by|current limitation|limitations?|performance gap|documented performance gap|image quality limitation|hardware-level image quality)"
+    ],
+    "forbidden_answer_patterns": [
+      "(?i)(guarantees|proves|confirms).{0,100}(full|complete|all|extremely low[- ]light|low[- ]light|poor visibility).{0,100}(performance|reliability|detection|low false-positive)",
+      "(?i)(maintains|achieves).{0,100}(full|complete|unchanged|low false-positive).{0,100}(performance|reliability|rates?).{0,100}(low[- ]light|poor visibility|all lighting)",
+      "(?i)(fully reliable|proven reliable).{0,100}(low[- ]light|poor visibility|all lighting|dark)"
+    ],
+    "notes": "Limitation/boundary case. It should contrast generic robustness claims with verification evidence that low-light image quality can be noisy/degraded or otherwise limited. This is not a pure no-answer case: the answer should identify the low-light limitation evidence and avoid claiming full confirmed performance."
+  },
+  {
+    "id": "on_device_no_cloud_ecu",
+    "query": "embedded edge inference no cloud connectivity external control unit ECU local processing",
+    "top_k": 5,
+    "expected_sources_any": [
+      "ai_model_deployment_handbook",
+      "edge_ai_product",
+      "commercial_vehicle_safety_regulation_whitepaper"
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "ai_model_deployment_handbook",
+        "chunks": [
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      {
+        "source": "edge_ai_product",
+        "chunks": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "notes": "Architecture constraint case. It checks whether retrieval can surface embedded/on-device, no-cloud, and ECU/external-control-unit evidence without requiring all possible supporting sources to appear."
+  },
+  {
+    "id": "rollback_update_unknowns",
+    "query": "firmware rollback model update procedure post-deployment threshold breach recovery plan",
+    "top_k": 5,
+    "expected_sources_any": [
+      "ai_model_deployment_handbook",
+      "monitoring_ai_performance",
+      "ai_regulations_standards"
+    ],
+    "expected_answer_mode": "insufficient_evidence",
+    "required_answer_patterns": [
+      "(?i)(not specified|not provided|not stated|not defined|not explicitly|cannot determine|placeholder|to be specified|incomplete|unknown|does not specify|does not provide)"
+    ],
+    "forbidden_answer_patterns": [
+      "(?i)(on-call owner is|escalation path is|responsible party is|the exact rollback procedure is|rollback owner is)"
+    ],
+    "forbidden_sources": [],
+    "notes": "Partial/no-answer deployment-lifecycle case. Retrieval should find deployment, monitoring, or regulatory recovery context, but the answer must not invent exact ownership or escalation details if the corpus leaves them incomplete."
+  },
+  {
+    "id": "privacy_face_pixelation",
+    "query": "face mosaic pixelation data protection privacy automatic adjustable face masking",
+    "top_k": 5,
+    "expected_sources_all": [
+      "edge_ai_product"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "edge_ai_product",
+        "chunks": [
+          0,
+          1
+        ]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "edge_ai_product",
+        "chunks": [
+          0,
+          1,
+          2
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "notes": "Privacy feature case. It should retrieve the edge product source around Face Mosaic / automatically adjustable face pixelation / data-protection behavior."
+  },
+  {
+    "id": "odd_metadata_attributes",
+    "query": "ODD metadata attributes lighting condition background foreground tracking filtering dataset assembly",
+    "top_k": 5,
+    "expected_sources_all": [
+      "data_management_handbook"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "data_management_handbook",
+        "chunks": [
+          23,
+          24,
+          29,
+          30,
+          31
+        ]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "data_management_handbook",
+        "chunks": [
+          22,
+          23,
+          24,
+          29,
+          30,
+          31,
+          32
+        ]
+      }
+    ],
+    "forbidden_sources": [],
+    "notes": "Data-management case. It should retrieve ODD metadata and dataset-filtering evidence around lighting/background/foreground attributes and synthetic-data assembly."
+  },
+  {
+    "id": "no_answer_actual_production_latency",
+    "query": "What is the exact end-to-end inference latency in milliseconds for person detection under the GS-BAU-70 certification test protocol, and how does it vary with INT8 quantization?",
+    "top_k": 5,
+    "expected_sources_any": [
+      "requirements_optimization_handbook",
+      "ai_model_verification_report",
+      "edge_ai_product"
+    ],
+    "expected_answer_mode": "insufficient_evidence",
+    "required_answer_patterns": [
+      "(?i)(not specified|not provided|not stated|not defined|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown|does not provide|does not specify|does not state|does not define|does not contain|no exact|no explicit)"
+    ],
+    "forbidden_answer_patterns": [
+      "(?i)(GS[- ]?BAU[- ]?70|certification test protocol).{0,120}(exact|certified|measured|protocol-specific).{0,120}(latency|end-to-end).{0,120}\\b[0-9]+(?:\\.[0-9]+)?\\s*ms",
+      "(?i)(INT8|quantization).{0,60}(latency|variation|delta|varies|changes).{0,60}(?:is|equals|measured|specifically|target)\\s*[0-9]+(?:\\.[0-9]+)?\\s*ms"
+    ],
+    "forbidden_sources": [],
+    "notes": "No-answer case. The corpus may mention generic latency or INT8/RKNN deployment, but it should not invent exact GS-BAU protocol latency or INT8-specific latency variation."
   }
 ]

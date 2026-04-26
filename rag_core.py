@@ -663,7 +663,8 @@ Use source ids, file names, and chunk ids only for citation/source mapping.
 Separate supported facts from inference.
 If the retrieved context does not support a claim, say so explicitly.
 Be conservative with safety-relevant claims.
-Cite sources using [S1], [S2], etc.; every bullet in "Supported facts" should have a citation.
+
+Citation rule: no [S#] citation means no claim. Cite every factual claim, inference, limitation, and "not specified" statement.
 
 Answer format:
 1. Conclusion

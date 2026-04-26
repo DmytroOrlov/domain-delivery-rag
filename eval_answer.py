@@ -231,12 +231,12 @@ def call_chat(prompt: str):
 # We still require the section number + section title, but allow optional Markdown
 # heading markers and bold markers around the title.
 REQUIRED_SECTION_PATTERNS = [
-    ("conclusion", r"(?im)^\s*#{0,6}\s*1[.)]\s*(?:\*\*)?\s*conclusion\b\s*(?:\*\*)?"),
-    ("supported_facts", r"(?im)^\s*#{0,6}\s*2[.)]\s*(?:\*\*)?\s*supported facts\b\s*(?:\*\*)?"),
-    ("inferences", r"(?im)^\s*#{0,6}\s*3[.)]\s*(?:\*\*)?\s*inferences\b\s*(?:\*\*)?"),
-    ("implementation_implications", r"(?im)^\s*#{0,6}\s*4[.)]\s*(?:\*\*)?\s*implementation implications\b\s*(?:\*\*)?"),
-    ("unknowns", r"(?im)^\s*#{0,6}\s*5[.)]\s*(?:\*\*)?\s*unknowns\s*/\s*verification needed\b\s*(?:\*\*)?"),
-    ("source_mapping", r"(?im)^\s*#{0,6}\s*6[.)]\s*(?:\*\*)?\s*source mapping\b\s*(?:\*\*)?"),
+    ("conclusion", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?1[.)]\s*(?:\*\*\s*)?conclusion\b(?:\s*\*\*)?"),
+    ("supported_facts", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?2[.)]\s*(?:\*\*\s*)?supported facts\b(?:\s*\*\*)?"),
+    ("inferences", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?3[.)]\s*(?:\*\*\s*)?inferences\b(?:\s*\*\*)?"),
+    ("implementation_implications", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?4[.)]\s*(?:\*\*\s*)?implementation implications\b(?:\s*\*\*)?"),
+    ("unknowns", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?5[.)]\s*(?:\*\*\s*)?unknowns\s*/\s*verification needed\b(?:\s*\*\*)?"),
+    ("source_mapping", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?6[.)]\s*(?:\*\*\s*)?source mapping\b(?:\s*\*\*)?"),
 ]
 
 REASONING_LEAK_PATTERNS = [
@@ -268,6 +268,10 @@ INSUFFICIENT_EVIDENCE_PATTERNS = [
     r"(?i)\bcannot determine\b",
     r"(?i)\bunknown\b",
     r"(?i)\bno retrieved evidence\b",
+    r"(?i)\bno direct evidence\b",
+    r"(?i)\bno evidence\b",
+    r"(?i)\b(?:does|do|did)\s+not\s+(?:specify|provide|state|define|contain|document)\b",
+    r"(?i)\b(?:is|are|was|were)\s+not\s+(?:specified|provided|stated|defined|documented)\b",
 
     # Natural Qwen phrasings observed in no-answer cases.
     r"(?i)\bdoes not provide\b",
@@ -297,6 +301,19 @@ CLASSIFICATION_METADATA_LEAK_PATTERNS = [
     r"\bhas_failure_or_degraded_mode\b",
     r"\bhas_regulatory_or_compliance\b",
 ]
+
+
+def normalize_answer_for_contract_checks(text: str) -> str:
+    """Normalize lightweight Markdown that should not affect answer-contract checks.
+
+    Qwen sometimes emits emphasis inside phrases that the eval contract checks,
+    for example ``does **not** specify``. The contract should judge the phrase,
+    not the Markdown decoration.
+    """
+    normalized = text or ""
+    normalized = re.sub(r"[`*_~]+", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
 
 
 def collect_regex_hits(text: str, patterns: list[str]):
@@ -334,6 +351,8 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
         failures.append("empty assistant content")
         return {"passed": False, "failures": failures, "warnings": warnings, "metrics": {}, "details": {}}
 
+    contract_answer = normalize_answer_for_contract_checks(answer)
+
     min_chars = int(case.get("min_answer_chars") or MIN_ANSWER_CHARS)
     if len(answer) < min_chars:
         failures.append(f"answer too short: chars={len(answer)} min={min_chars}")
@@ -369,20 +388,33 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
     if metadata_hits:
         failures.append(f"classification metadata leaked into answer: {metadata_hits[:5]}")
 
-    if case.get("expected_answer_mode") == "insufficient_evidence":
-        insufficiency_hits = collect_regex_hits(answer, INSUFFICIENT_EVIDENCE_PATTERNS)
+    answer_mode = case.get("expected_answer_mode")
+    if answer_mode == "insufficient_evidence":
+        insufficiency_hits = collect_regex_hits(contract_answer, INSUFFICIENT_EVIDENCE_PATTERNS)
         if not insufficiency_hits:
             failures.append(
                 "expected insufficient-evidence behavior, but answer did not contain "
                 "an explicit uncertainty/abstention phrase"
             )
+    elif answer_mode == "limitation":
+        # Limitation/boundary cases are not pure no-answer cases. They can be
+        # supported by partial evidence (for example documented low-light noise)
+        # while still requiring the answer not to overclaim. Case-specific
+        # required_answer_patterns and forbidden_answer_patterns enforce that
+        # contract without a brittle global abstention-phrase check.
+        pass
 
     for pattern in case.get("required_answer_patterns", []):
-        if not re.search(pattern, answer, flags=re.I | re.M):
+        if not (
+            re.search(pattern, answer, flags=re.I | re.M)
+            or re.search(pattern, contract_answer, flags=re.I | re.M)
+        ):
             failures.append(f"missing required answer pattern: {pattern}")
 
     for pattern in case.get("forbidden_answer_patterns", []):
-        m = re.search(pattern, answer, flags=re.I | re.M)
+        m = re.search(pattern, answer, flags=re.I | re.M) or re.search(
+            pattern, contract_answer, flags=re.I | re.M
+        )
         if m:
             failures.append(f"forbidden answer pattern matched: {pattern}; match={m.group(0)[:160]!r}")
 

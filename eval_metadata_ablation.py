@@ -37,6 +37,10 @@ The score is intentionally a review aid, not a production truth metric. It makes
 "both modes pass, but one selected better evidence" visible without creating a
 new eval script.
 
+Tiny rank-only score drops are reported separately as MINOR_RANK_SHIFT when the
+selected and expanded evidence sets are unchanged. They still contribute to the
+total graded score, but they are not counted as meaningful score regressions.
+
 Cases with no retrieval expectations, such as no-answer/insufficient-evidence
 answer-only cases, still participate in PASS/FAIL ablation but are excluded from
 the graded retrieval-score total.
@@ -72,6 +76,11 @@ import rag_core as rc
 
 
 RUN_ROOT = Path(os.environ.get("RAG_EVAL_RUN_DIR", os.path.expanduser("~/rag_v1/eval_runs")))
+
+# A small negative score delta caused only by reordering the same selected
+# evidence is diagnostic noise, not a meaningful retrieval regression. Keep the
+# score delta visible, but classify it separately from SCORE_REGRESSED.
+MINOR_RANK_SHIFT_MAX_DELTA = 0.25
 
 
 def item_ref(item: dict[str, Any]) -> str:
@@ -343,6 +352,19 @@ def compare_case(case: dict[str, Any]) -> dict[str, Any]:
     if raw_score is not None and meta_score is not None:
         score_delta = round(meta_score["score"] - raw_score["score"], 4)
 
+    selected_set_same = raw_set == meta_set
+    expanded_set_same = set(raw["expanded"]) == set(meta["expanded"])
+    minor_rank_shift = (
+        raw["passed"]
+        and meta["passed"]
+        and score_delta is not None
+        and score_delta < 0
+        and abs(score_delta) <= MINOR_RANK_SHIFT_MAX_DELTA
+        and selected_set_same
+        and expanded_set_same
+        and bool(rank_changes)
+    )
+
     status = "UNCHANGED"
     if raw["passed"] and not meta["passed"]:
         status = "REGRESSION"
@@ -350,6 +372,8 @@ def compare_case(case: dict[str, Any]) -> dict[str, Any]:
         status = "IMPROVEMENT"
     elif raw["passed"] and meta["passed"] and score_delta is not None and score_delta > 0:
         status = "SCORE_IMPROVED"
+    elif minor_rank_shift:
+        status = "MINOR_RANK_SHIFT"
     elif raw["passed"] and meta["passed"] and score_delta is not None and score_delta < 0:
         status = "SCORE_REGRESSED"
     elif raw["passed"] and meta["passed"] and (added or removed or rank_changes):
@@ -492,6 +516,7 @@ def main() -> None:
     improvements = [r["id"] for r in results if r["status"] == "IMPROVEMENT"]
     score_regressions = [r["id"] for r in results if r["status"] == "SCORE_REGRESSED"]
     score_improvements = [r["id"] for r in results if r["status"] == "SCORE_IMPROVED"]
+    minor_rank_shifts = [r["id"] for r in results if r["status"] == "MINOR_RANK_SHIFT"]
     changed = [r["id"] for r in results if r["selection_added_by_metadata"] or r["selection_removed_by_metadata"]]
 
     scored_results = [r for r in results if r["score_delta"] is not None]
@@ -511,6 +536,7 @@ def main() -> None:
         "improvements": improvements,
         "score_regressions": score_regressions,
         "score_improvements": score_improvements,
+        "minor_rank_shifts": minor_rank_shifts,
         "selection_changed": changed,
         "results": results,
     }
@@ -540,6 +566,9 @@ def main() -> None:
     print(f"Score regressions: {len(score_regressions)}")
     for cid in score_regressions:
         print(f"  - {cid}")
+    print(f"Minor rank-only shifts: {len(minor_rank_shifts)}")
+    for cid in minor_rank_shifts:
+        print(f"  ~ {cid}")
     print(f"Selection changed: {len(changed)}")
     for cid in changed:
         print(f"  * {cid}")
