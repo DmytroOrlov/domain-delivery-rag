@@ -5,9 +5,7 @@
     "top_k": 5,
     "expected_sources_all": [
       "edge_ai_product",
-      "commercial_vehicle_safety_regulation_whitepaper"
-    ],
-    "expected_sources_any": [
+      "commercial_vehicle_safety_regulation_whitepaper",
       "ai_model_verification_report"
     ],
     "expected_selected_chunks_any": [
@@ -46,7 +44,7 @@
       }
     ],
     "forbidden_sources": [],
-    "notes": "General warning/safety query should retrieve product warning behavior, BSIS/R151 context, and preferably FP/ODD verification evidence. Source aliases are resolved through eval_source_map.local.json."
+    "notes": "Broad synthesis query. It should cover all three core evidence families: product warning behavior, BSIS/R151 regulatory context, and FP/ODD verification evidence. Chunk expectations remain loose because neighboring chunks may carry the same evidence."
   },
   {
     "id": "three_stage_warning_logic",
@@ -66,7 +64,16 @@
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should hit the source that explicitly mentions yellow/red/red+alarm tone and CAN/GPIO interfaces."
+    "notes": "Exact warning/interface query. The selected results should hit the regulation/whitepaper source around the three-stage warning and CAN/GPIO evidence; neighboring chunks may provide the surrounding product/system context.",
+    "expected_selected_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          29,
+          32
+        ]
+      }
+    ]
   },
   {
     "id": "degraded_detection_shutdown",
@@ -79,13 +86,24 @@
       {
         "source": "commercial_vehicle_safety_regulation_whitepaper",
         "chunks": [
+          28,
           29,
-          30
+          30,
+          31
         ]
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should retrieve degraded-mode/shutdown evidence from the regulation/whitepaper source. The edge product source may appear as useful supporting context, but is not required."
+    "notes": "Exact degraded-mode/shutdown query. It should select the regulation/whitepaper shutdown/degraded-mode evidence. The edge product source may appear as useful supporting context, but is not required.",
+    "expected_selected_chunks_any": [
+      {
+        "source": "commercial_vehicle_safety_regulation_whitepaper",
+        "chunks": [
+          29,
+          30
+        ]
+      }
+    ]
   },
   {
     "id": "false_positive_mitigation_odd_testing",
@@ -98,13 +116,23 @@
       {
         "source": "ai_model_verification_report",
         "chunks": [
+          4,
           5,
           6
         ]
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should retrieve verification report evidence about low light, hard negative mining, VLM-generated ODD images, and FP mitigation."
+    "notes": "Exact FP/ODD verification query. It should select the verification report chunks covering low-light behavior, VLM-generated ODD images, and hard-negative mining.",
+    "expected_selected_chunks_any": [
+      {
+        "source": "ai_model_verification_report",
+        "chunks": [
+          5,
+          6
+        ]
+      }
+    ]
   },
   {
     "id": "embedded_edge_deployment",
@@ -117,6 +145,7 @@
       {
         "source": "ai_model_deployment_handbook",
         "chunks": [
+          3,
           4,
           5,
           6
@@ -124,7 +153,21 @@
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should retrieve deployment architecture and runtime/integration evidence."
+    "notes": "Exact deployment/runtime query. It should select both primary deployment chunks covering embedded runtime/model conversion and rollout/rollback or integration behavior.",
+    "expected_selected_chunks_any": [
+      {
+        "source": "ai_model_deployment_handbook",
+        "chunks": [
+          4
+        ]
+      },
+      {
+        "source": "ai_model_deployment_handbook",
+        "chunks": [
+          5
+        ]
+      }
+    ]
   },
   {
     "id": "requirements_validation_latency",
@@ -137,14 +180,22 @@
       {
         "source": "requirements_optimization_handbook",
         "chunks": [
-          11,
           12,
-          13
+          13,
+          14
         ]
       }
     ],
     "forbidden_sources": [],
-    "notes": "Should retrieve requirements/test-case evidence around latency, pedestrian detection, KPIs, and validation."
+    "notes": "Exact requirements/validation query. It should select the requirements/test-case chunk that contains latency, pedestrian detection, KPIs, and validation evidence.",
+    "expected_selected_chunks_any": [
+      {
+        "source": "requirements_optimization_handbook",
+        "chunks": [
+          13
+        ]
+      }
+    ]
   },
   {
     "id": "unknown_warning_transition_thresholds",

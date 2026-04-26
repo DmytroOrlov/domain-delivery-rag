@@ -50,10 +50,8 @@ DEFAULT_TOP_K = int(os.environ.get("RAG_ASK_TOP_K", str(rc.DEFAULT_TOP_K)))
 DEFAULT_PRE_K = int(os.environ.get("RAG_ASK_PRE_K", str(rc.DEFAULT_PRE_K)))
 MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(rc.DEFAULT_MAX_PER_FILE)))
 NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", str(rc.DEFAULT_NEIGHBOR_RADIUS)))
-MAX_TOKENS = int(os.environ.get("RAG_ASK_MAX_TOKENS", "10000"))
+MAX_TOKENS = int(os.environ.get("RAG_ASK_MAX_TOKENS", "16384"))
 TIMEOUT = int(os.environ.get("RAG_ASK_TIMEOUT", "1800"))
-TEMPERATURE = float(os.environ.get("RAG_ASK_TEMPERATURE", "0.0"))
-TOP_P = float(os.environ.get("RAG_ASK_TOP_P", "0.9"))
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
 
 
@@ -104,8 +102,6 @@ def call_chat(prompt: str) -> tuple[str, dict[str, Any]]:
     payload: dict[str, Any] = {
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "temperature": TEMPERATURE,
-        "top_p": TOP_P,
         "max_tokens": MAX_TOKENS,
     }
 

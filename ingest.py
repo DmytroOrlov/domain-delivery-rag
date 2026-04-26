@@ -56,7 +56,7 @@ METADATA_TARGET_BATCH_SIZE = int(os.environ.get("RAG_METADATA_TARGET_BATCH_SIZE"
 # This is NOT a hard request cap: large files may require more batches to respect
 # METADATA_MAX_BATCH_SIZE. Retry splits can also increase the actual request count.
 METADATA_TARGET_MAX_INITIAL_BATCHES = int(os.environ.get("RAG_METADATA_TARGET_MAX_INITIAL_BATCHES", "3"))
-METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "30"))
+METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "25"))
 
 # Default: do NOT index chunks classified as drop.
 # For debugging, run:
@@ -657,10 +657,6 @@ def make_balanced_batches(
     n = len(chunks)
     if n == 0:
         return []
-
-    target_batch_size = max(1, int(target_batch_size))
-    target_max_initial_batches = max(1, int(target_max_initial_batches))
-    max_batch_size = max(1, int(max_batch_size))
 
     desired_by_target = (n + target_batch_size - 1) // target_batch_size
     desired_by_cap = (n + max_batch_size - 1) // max_batch_size

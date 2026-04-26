@@ -72,10 +72,8 @@ RUNS_DIR = Path(os.environ.get("RAG_EVAL_RUNS_DIR", str(BASE_DIR / "eval_runs"))
 
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
 
-ANSWER_MAX_TOKENS = int(os.environ.get("RAG_ANSWER_EVAL_MAX_TOKENS", "9000"))
+ANSWER_MAX_TOKENS = int(os.environ.get("RAG_ANSWER_EVAL_MAX_TOKENS", "16384"))
 ANSWER_TIMEOUT = int(os.environ.get("RAG_ANSWER_EVAL_TIMEOUT", "1800"))
-ANSWER_TEMPERATURE = float(os.environ.get("RAG_ANSWER_EVAL_TEMPERATURE", "0.0"))
-ANSWER_TOP_P = float(os.environ.get("RAG_ANSWER_EVAL_TOP_P", "0.9"))
 DEFAULT_TOP_K = int(os.environ.get("RAG_ANSWER_EVAL_TOP_K", "5"))
 
 MIN_ANSWER_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CHARS", "600"))
@@ -179,8 +177,6 @@ def call_chat(prompt: str):
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "temperature": ANSWER_TEMPERATURE,
-        "top_p": ANSWER_TOP_P,
         "max_tokens": ANSWER_MAX_TOKENS,
     }
 
@@ -525,8 +521,6 @@ def main():
     print(f"Answer max tokens: {ANSWER_MAX_TOKENS}")
     print(f"Answer timeout: {ANSWER_TIMEOUT}")
     print("Qwen response handling: default server response parsed locally; no response-routing override is sent")
-    print(f"Temperature: {ANSWER_TEMPERATURE}")
-    print(f"Top-p: {ANSWER_TOP_P}")
     print(f"Cases: {len(cases)}")
     print("Eval scope: answer contract / grounding hygiene; not full semantic faithfulness.")
     print("Retrieval/context packing is delegated to rag_core.py.")
