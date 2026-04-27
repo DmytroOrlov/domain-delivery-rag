@@ -326,7 +326,22 @@ def collect_regex_hits(text: str, patterns: list[str]):
 
 
 def citation_ids(answer: str):
-    return [int(x) for x in re.findall(r"\[S(\d+)\]", answer or "")]
+    """Extract source citation ids from bracketed RAG citations.
+
+    Canonical output is still [S1], [S2], ... and the prompt should ask for
+    exactly that. The eval also accepts common model drift such as
+    [S1, chunk 11], [S1, chunk 11; S2, chunk 4], or [S1; S1, chunk 12]
+    because these still explicitly cite retrieved source ids.
+
+    Keep this intentionally scoped to square-bracket citations. Do not parse
+    bare S1 mentions in normal prose; those are too easy to confuse with other
+    identifiers.
+    """
+    ids: list[int] = []
+    for bracket_body in re.findall(r"\[([^\]]+)\]", answer or ""):
+        for value in re.findall(r"\bS(\d+)\b", bracket_body):
+            ids.append(int(value))
+    return ids
 
 
 def check_required_sections(answer: str):
@@ -362,12 +377,12 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
 
     citations = citation_ids(answer)
     unique_citations = sorted(set(citations))
-    min_citations = int(case.get("min_citation_count") or MIN_CITATION_COUNT)
+    min_citations = int(case["min_citation_count"]) if "min_citation_count" in case else MIN_CITATION_COUNT
 
     if len(citations) < min_citations:
         failures.append(f"too few source citations: citations={len(citations)} min={min_citations}")
-    if not unique_citations:
-        failures.append("no [S#] citations found")
+    if min_citations > 0 and not unique_citations:
+        failures.append("no source citations found in [S#] / [S#, ...] format")
 
     suspicious_source_ids = [x for x in unique_citations if x > 12]
     if suspicious_source_ids:

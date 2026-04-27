@@ -51,8 +51,8 @@ Usage
   python3 eval_metadata_ablation.py blind_spot_warning_implications
 
 Helpful env vars are the same as eval_retrieval.py:
-  RAG_EVAL_FILE=~/rag_v1/eval_queries.json
-  RAG_EVAL_SOURCE_MAP=~/rag_v1/eval_source_map.local.json
+  RAG_EVAL_FILE=eval_queries.json
+  RAG_EVAL_SOURCE_MAP=eval_source_map.local.json
   RAG_EVAL_TOP_K=5
   RAG_EVAL_PRE_K=24
   RAG_MAX_PER_FILE=2
@@ -75,12 +75,39 @@ import eval_retrieval as ev
 import rag_core as rc
 
 
-RUN_ROOT = Path(os.environ.get("RAG_EVAL_RUN_DIR", os.path.expanduser("~/rag_v1/eval_runs")))
+RUN_ROOT = Path(
+    os.environ.get(
+        "RAG_EVAL_RUN_DIR",
+        getattr(rc.DOMAIN, "eval_run_dir", "eval_runs"),
+    )
+).expanduser()
 
 # A small negative score delta caused only by reordering the same selected
 # evidence is diagnostic noise, not a meaningful retrieval regression. Keep the
 # score delta visible, but classify it separately from SCORE_REGRESSED.
 MINOR_RANK_SHIFT_MAX_DELTA = 0.25
+
+
+def _expand_eval_path(value: Any, fallback: str) -> Path:
+    raw = str(value) if value else fallback
+    return Path(raw).expanduser()
+
+
+# eval_retrieval owns EVAL_FILE / SOURCE_MAP_FILE, but older domain-config
+# patches may leave paths like "~/rag_v1/eval_queries.json" unexpanded there.
+# Normalize them here so this ablation script works with both pre-domain and
+# domain-config versions of eval_retrieval.py.
+ev.EVAL_FILE = _expand_eval_path(
+    os.environ.get("RAG_EVAL_FILE", getattr(rc.DOMAIN, "eval_file", getattr(ev, "EVAL_FILE", "eval_queries.json"))),
+    "eval_queries.json",
+)
+ev.SOURCE_MAP_FILE = _expand_eval_path(
+    os.environ.get(
+        "RAG_EVAL_SOURCE_MAP",
+        getattr(rc.DOMAIN, "eval_source_map", getattr(ev, "SOURCE_MAP_FILE", "eval_source_map.local.json")),
+    ),
+    "eval_source_map.local.json",
+)
 
 
 def item_ref(item: dict[str, Any]) -> str:
@@ -488,6 +515,7 @@ def main() -> None:
     print("=" * 100)
     print("RAG METADATA PRIOR ABLATION START")
     print("=" * 100)
+    print(f"Domain: {cfg.get('domain_id')} ({cfg.get('domain_display_name')})")
     print(f"Eval file: {ev.EVAL_FILE}")
     print(f"Source map: {ev.SOURCE_MAP_FILE} ({'loaded' if ev.load_source_map() else 'not loaded'})")
     print(f"Run dir: {run_dir}")

@@ -26,7 +26,7 @@ logical source aliases:
 
 Aliases are resolved through a local, untracked source map:
 
-  RAG_EVAL_SOURCE_MAP=~/rag_v1/eval_source_map.local.json
+  RAG_EVAL_SOURCE_MAP=eval_source_map.local.json
 
 The source map contains the real file names and should not be committed. Direct
 file-name expectations are still supported for local/private use, but aliases are
@@ -50,8 +50,8 @@ from typing import Any
 
 import rag_core as rc
 
-EVAL_FILE = os.environ.get("RAG_EVAL_FILE", os.path.expanduser("~/rag_v1/eval_queries.json"))
-SOURCE_MAP_FILE = os.environ.get("RAG_EVAL_SOURCE_MAP", os.path.expanduser("~/rag_v1/eval_source_map.local.json"))
+EVAL_FILE = os.environ.get("RAG_EVAL_FILE", rc.DOMAIN.eval_file)
+SOURCE_MAP_FILE = os.environ.get("RAG_EVAL_SOURCE_MAP", rc.DOMAIN.eval_source_map)
 DEFAULT_TOP_K = int(os.environ.get("RAG_EVAL_TOP_K", str(rc.DEFAULT_TOP_K)))
 DEFAULT_PRE_K = int(os.environ.get("RAG_EVAL_PRE_K", str(rc.DEFAULT_PRE_K)))
 DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(rc.DEFAULT_MAX_PER_FILE)))
@@ -316,6 +316,7 @@ def main():
     print("=" * 100)
     print("RAG RETRIEVAL-ONLY EVAL START")
     print("=" * 100)
+    print(f"Domain: {cfg.get('domain_id')} ({cfg.get('domain_display_name')})")
     print(f"Eval file: {EVAL_FILE}")
     print(f"Source map: {SOURCE_MAP_FILE} ({'loaded' if source_map else 'not loaded'})")
     print(f"Retrieval mode: {cfg['mode']} (hybrid {cfg['hybrid']})")

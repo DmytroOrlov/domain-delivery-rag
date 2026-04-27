@@ -178,6 +178,7 @@ def main() -> None:
     print("=" * 100)
     print("RAG ASK DEBUG START")
     print("=" * 100)
+    print(f"Domain: {cfg.get('domain_id')} ({cfg.get('domain_display_name')})")
     print(f"Question: {question}")
     print(f"Chat URL: {CHAT_URL}")
     print(f"Retrieval mode: {cfg['mode']} (hybrid {cfg['hybrid']})")

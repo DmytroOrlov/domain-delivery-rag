@@ -220,12 +220,10 @@
       "(?i)(not specified|not provided|not stated|not defined|not enough evidence|insufficient evidence|not explicitly|cannot determine|unknown|does not provide|does not specify|does not state|does not define|does not contain|no exact|no explicit)"
     ],
     "forbidden_answer_patterns": [
-      "(?i)(blind spot|pedestrian detection|warning function|this function|the function).{0,120}\\bASIL\\s*[-:]?\\s*[ABCD]\\b",
-      "(?i)\\bASIL\\s*[-:]?\\s*[ABCD]\\b.{0,120}(blind spot|pedestrian detection|warning function|this function|the function)",
-      "(?i)(blind spot|pedestrian detection|warning function|this function|the function).{0,120}\\bSIL\\s*[-:]?\\s*[1-4]\\b",
-      "(?i)\\bSIL\\s*[-:]?\\s*[1-4]\\b.{0,120}(blind spot|pedestrian detection|warning function|this function|the function)"
+      "(?i)(blind spot|pedestrian detection|warning function|this function|the function).{0,120}\\b(?:is|has|assigned|classified as|rated as)\\s+(?:ASIL\\s*[-:]?\\s*[ABCD]|SIL\\s*[-:]?\\s*[1-4])\\b",
+      "(?i)\\b(?:ASIL\\s*[-:]?\\s*[ABCD]|SIL\\s*[-:]?\\s*[1-4])\\b.{0,120}(?:assigned to|classified for|rated for|applies to).{0,80}(blind spot|pedestrian detection|warning function|this function|the function)"
     ],
-    "notes": "No-answer/insufficient-evidence case. Corpus may discuss safety relevance and standards, but should not invent ASIL/SIL assignment or formal safety-goal wording."
+    "notes": "No-answer/insufficient-evidence case. Corpus may discuss safety relevance and standards, but should not invent ASIL/SIL assignment or formal safety-goal wording. Forbidden patterns only reject explicit ASIL/SIL assignment to the queried function; negative enumeration such as “does not specify ASIL A-D” is allowed."
   },
   {
     "id": "bsis_vs_mois_scope",
@@ -341,11 +339,11 @@
       "(?i)(severe image noise|image noise|noise|noisy|degrad(?:e|es|ed|ing|ation)?|reduced contrast|blurred|limited by|current limitation|limitations?|performance gap|documented performance gap|image quality limitation|hardware-level image quality)"
     ],
     "forbidden_answer_patterns": [
-      "(?i)(guarantees|proves|confirms).{0,100}(full|complete|all|extremely low[- ]light|low[- ]light|poor visibility).{0,100}(performance|reliability|detection|low false-positive)",
-      "(?i)(maintains|achieves).{0,100}(full|complete|unchanged|low false-positive).{0,100}(performance|reliability|rates?).{0,100}(low[- ]light|poor visibility|all lighting)",
-      "(?i)(fully reliable|proven reliable).{0,100}(low[- ]light|poor visibility|all lighting|dark)"
+      "(?i)(guarantees|proves|confirms).{0,80}(full|complete|all|unchanged|reliable|safe|low false-positive).{0,80}(low[- ]light|poor visibility|lighting).{0,80}(performance|reliability|detection|operation|rates?)",
+      "(?i)(maintains|achieves).{0,80}(full|complete|unchanged|low false-positive).{0,80}(performance|reliability|detection|rates?).{0,80}(low[- ]light|poor visibility|all lighting)",
+      "(?i)(fully reliable|proven reliable).{0,80}(low[- ]light|poor visibility|all lighting|dark)"
     ],
-    "notes": "Limitation/boundary case. It should contrast generic robustness claims with verification evidence that low-light image quality can be noisy/degraded or otherwise limited. This is not a pure no-answer case: the answer should identify the low-light limitation evidence and avoid claiming full confirmed performance."
+    "notes": "Limitation/boundary case. It should contrast generic robustness claims with verification evidence that low-light image quality can be noisy/degraded or otherwise limited. This is not a pure no-answer case: the answer should identify the low-light limitation evidence and avoid claiming full confirmed performance. Overclaim checks are limited to full/guaranteed low-light performance; confirming low-light degradation/noise is allowed."
   },
   {
     "id": "on_device_no_cloud_ecu",

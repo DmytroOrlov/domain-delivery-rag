@@ -1,0 +1,22 @@
+{
+  "id": "adas_embedded_vision",
+  "display_name": "ADAS Embedded Vision Delivery RAG",
+  "collection": "rag_v1_chunks",
+  "input_dir": "files",
+  "failure_dir": "metadata_failures",
+  "eval_file": "eval_queries.json",
+  "eval_source_map": "eval_source_map.local.json",
+  "eval_run_dir": "eval_runs",
+  "answer_persona": "You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.",
+  "retrieval_defaults": {
+    "top_k": 5,
+    "pre_k": 24,
+    "max_per_file": 2,
+    "neighbor_radius": 1
+  },
+  "context_defaults": {
+    "selected_max_chars": 2200,
+    "neighbor_snippet_chars": 700,
+    "context_max_chars": 18000
+  }
+}

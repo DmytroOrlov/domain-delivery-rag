@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
+from domain_config import load_domain_config
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
@@ -57,18 +58,20 @@ from qdrant_client.http import models
 # Configuration
 # =============================================================================
 
+DOMAIN = load_domain_config()
+
 EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
 QDRANT_URL = os.environ.get("RAG_QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.environ.get("RAG_COLLECTION", "rag_v1_chunks")
+COLLECTION = os.environ.get("RAG_COLLECTION", DOMAIN.collection)
 
-DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
-DEFAULT_PRE_K = int(os.environ.get("RAG_PRE_K", "24"))
-DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", "2"))
-DEFAULT_NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", "1"))
+DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", str(DOMAIN.retrieval_defaults.get("top_k", 5))))
+DEFAULT_PRE_K = int(os.environ.get("RAG_PRE_K", str(DOMAIN.retrieval_defaults.get("pre_k", 24))))
+DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(DOMAIN.retrieval_defaults.get("max_per_file", 2))))
+DEFAULT_NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", str(DOMAIN.retrieval_defaults.get("neighbor_radius", 1))))
 
-SELECTED_MAX_CHARS = int(os.environ.get("RAG_SELECTED_MAX_CHARS", "2200"))
-NEIGHBOR_SNIPPET_CHARS = int(os.environ.get("RAG_NEIGHBOR_SNIPPET_CHARS", "700"))
-CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", "18000"))
+SELECTED_MAX_CHARS = int(os.environ.get("RAG_SELECTED_MAX_CHARS", str(DOMAIN.context_defaults.get("selected_max_chars", 2200))))
+NEIGHBOR_SNIPPET_CHARS = int(os.environ.get("RAG_NEIGHBOR_SNIPPET_CHARS", str(DOMAIN.context_defaults.get("neighbor_snippet_chars", 700))))
+CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(DOMAIN.context_defaults.get("context_max_chars", 18000))))
 
 # Bounded metadata rerank. This is a heuristic, not a learned ranker.
 # It can reorder close dense candidates; this is intentional but must remain
@@ -655,7 +658,7 @@ def build_augmented_prompt(
         include_full_path=False,
     )
 
-    prompt = f"""You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.
+    prompt = f"""{DOMAIN.answer_persona}
 
 Use the retrieved context first.
 The retrieved chunk text is the source of truth.
@@ -700,6 +703,8 @@ Retrieved context:
 
 def retrieval_config_summary() -> dict[str, Any]:
     return {
+        "domain_id": DOMAIN.id,
+        "domain_display_name": DOMAIN.display_name,
         "mode": "dense",
         "embed_url": EMBED_URL,
         "qdrant_url": QDRANT_URL,

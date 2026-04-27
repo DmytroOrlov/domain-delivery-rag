@@ -37,8 +37,8 @@ from qdrant_client.http import models
 # =============================================================================
 
 
-INPUT_DIR = os.path.expanduser("~/rag_v1/files")
-FAILURE_DIR = os.path.expanduser("~/rag_v1/metadata_failures")
+INPUT_DIR = os.path.expanduser("files")
+FAILURE_DIR = os.path.expanduser("metadata_failures")
 
 EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
@@ -60,7 +60,7 @@ METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "25"
 
 # Default: do NOT index chunks classified as drop.
 # For debugging, run:
-#   RAG_INDEX_DROPPED_CHUNKS=1 python3 ~/rag_v1/ingest.py
+#   RAG_INDEX_DROPPED_CHUNKS=1 python3 ingest.py
 INDEX_DROPPED_CHUNKS = os.environ.get("RAG_INDEX_DROPPED_CHUNKS", "0") == "1"
 
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
