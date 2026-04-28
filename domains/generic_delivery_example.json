@@ -1,0 +1,406 @@
+{
+  "id": "generic_delivery_example",
+  "display_name": "Generic Delivery RAG Example",
+  "collection": "rag_generic_delivery_example_chunks",
+  "input_dir": "examples/generic_delivery/files",
+  "failure_dir": "metadata_failures/generic_delivery_example",
+  "eval_file": "evals/generic_delivery_example/eval_queries.json",
+  "eval_source_map": "evals/generic_delivery_example/eval_source_map.local.example.json",
+  "eval_run_dir": "eval_runs/generic_delivery_example",
+  "answer_persona": "You are a senior domain delivery assistant.",
+  "retrieval_defaults": {
+    "top_k": 5,
+    "pre_k": 24,
+    "max_per_file": 2,
+    "neighbor_radius": 1
+  },
+  "context_defaults": {
+    "selected_max_chars": 2200,
+    "neighbor_snippet_chars": 700,
+    "context_max_chars": 18000
+  },
+  "query_profiles": [
+    {
+      "name": "risk_or_blocker",
+      "triggers": [
+        "risk",
+        "blocker",
+        "failure",
+        "constraint",
+        "dependency"
+      ],
+      "add_facets": [
+        "risk",
+        "dependency"
+      ],
+      "add_layers": [
+        "engineering",
+        "operations"
+      ],
+      "add_flags": [
+        "has_risk"
+      ]
+    },
+    {
+      "name": "decision_or_requirement",
+      "triggers": [
+        "decision",
+        "requirement",
+        "must",
+        "owner",
+        "plan"
+      ],
+      "add_roles": [
+        "decision",
+        "requirement"
+      ],
+      "add_facets": [
+        "decision",
+        "requirement"
+      ],
+      "add_flags": [
+        "has_decision",
+        "has_requirement"
+      ]
+    },
+    {
+      "name": "metrics",
+      "triggers": [
+        "metric",
+        "kpi",
+        "latency",
+        "cost",
+        "quality",
+        "score"
+      ],
+      "add_facets": [
+        "metric"
+      ],
+      "add_flags": [
+        "has_metric"
+      ]
+    }
+  ],
+  "rerank": {
+    "clamp": [
+      -0.045,
+      0.05
+    ],
+    "base_weights": {
+      "decision": {
+        "primary": 0.005,
+        "drop": -0.04
+      },
+      "delivery_value": {
+        "high": 0.005,
+        "medium": 0.002,
+        "low": -0.002
+      },
+      "criticality": {
+        "high": 0.004,
+        "medium": 0.001
+      },
+      "role": {
+        "noise": -0.04,
+        "unknown": -0.01
+      }
+    },
+    "confidence_weight": 0.0025,
+    "hit_weights": {
+      "role": {
+        "per_hit": 0.005,
+        "cap": 0.008
+      },
+      "facet": {
+        "per_hit": 0.004,
+        "cap": 0.016
+      },
+      "layer": {
+        "per_hit": 0.003,
+        "cap": 0.009
+      },
+      "stage": {
+        "per_hit": 0.002,
+        "cap": 0.006
+      },
+      "flag": 0.005
+    }
+  },
+  "answer": {
+    "persona": "You are a senior domain delivery assistant.",
+    "grounding_rules": [
+      "Use the retrieved context first.",
+      "The retrieved chunk text is the source of truth.",
+      "Separate supported facts from inference.",
+      "If the retrieved context does not support a claim, say so explicitly."
+    ],
+    "citation_rule": "Citation rule: use exact citations like [S1], [S2]. No [S#] citation means no claim.",
+    "sections": [
+      "Conclusion",
+      "Supported facts",
+      "Inferences",
+      "Risks / implications",
+      "Unknowns / verification needed",
+      "Source mapping"
+    ],
+    "repair_rules": [
+      "Use the same retrieved context from the original prompt.",
+      "Use exact source citations like [S1], [S2]. Do not put chunk ids, file names, commas, or extra text inside citation brackets.",
+      "No [S#] citation means no claim.",
+      "For missing evidence, cite the retrieved sources reviewed and state what is not specified.",
+      "Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.",
+      "Do not repeat the same phrase or bullet.",
+      "Keep the answer concise."
+    ]
+  },
+  "metadata_schema": {
+    "evidence_role": [
+      "overview",
+      "requirement",
+      "decision",
+      "architecture",
+      "process",
+      "risk",
+      "metric",
+      "example",
+      "noise",
+      "unknown"
+    ],
+    "evidence_facets": [
+      "requirement",
+      "decision",
+      "risk",
+      "dependency",
+      "timeline",
+      "metric",
+      "implementation",
+      "operation",
+      "customer_impact",
+      "cost",
+      "security",
+      "privacy",
+      "unknown"
+    ],
+    "delivery_layers": [
+      "product",
+      "engineering",
+      "operations",
+      "data",
+      "customer",
+      "business",
+      "governance",
+      "unknown"
+    ],
+    "delivery_stages": [
+      "discovery",
+      "planning",
+      "implementation",
+      "validation",
+      "release",
+      "operation",
+      "unknown"
+    ],
+    "business_impact": [
+      "high",
+      "medium",
+      "low",
+      "unknown"
+    ],
+    "delivery_value": [
+      "high",
+      "medium",
+      "low"
+    ],
+    "evidence_decision": [
+      "primary",
+      "secondary",
+      "drop",
+      "unknown"
+    ],
+    "boolean_flags": [
+      "has_decision",
+      "has_requirement",
+      "has_risk",
+      "has_metric",
+      "has_owner_or_dependency"
+    ]
+  },
+  "metadata_extraction": {
+    "system_rules": [
+      "Classify each chunk independently for the active Domain Delivery RAG.",
+      "Use only the chunk text.",
+      "Use unknown when evidence is weak.",
+      "Return compact JSON only."
+    ],
+    "objective": "Classify chunks for a generic delivery-oriented RAG over product, engineering, operations, and decision documents.",
+    "field_definitions": {
+      "role": "Main evidence role of the chunk.",
+      "facets": "Evidence facets present in the chunk.",
+      "layers": "Delivery layers discussed by the chunk.",
+      "stages": "Lifecycle stages discussed by the chunk.",
+      "criticality": "Business or delivery impact of the evidence.",
+      "delivery_value": "Usefulness for implementation, validation, release, or operation decisions.",
+      "decision": "primary for high-value evidence, secondary for support, drop for low-signal chunks."
+    },
+    "return_instruction": "Return JSON mapping chunk index to metadata object. Do not include markdown."
+  },
+  "metadata_field_map": {
+    "role": "evidence_role",
+    "facets": "evidence_facets",
+    "layers": "delivery_layers",
+    "stages": "delivery_stages",
+    "criticality": "business_impact",
+    "delivery_value": "delivery_value",
+    "decision": "evidence_decision",
+    "document_primary_role": "document_primary_role",
+    "document_roles": "document_roles",
+    "document_facets": "document_evidence_facets",
+    "document_layers": "document_delivery_layers",
+    "document_stages": "document_delivery_stages",
+    "document_criticality": "document_business_impact",
+    "document_delivery_value": "document_delivery_value",
+    "document_decision": "document_evidence_decision",
+    "document_confidence": "document_confidence",
+    "document_signal_chunks": "document_signal_chunks"
+  },
+  "document_aggregation": {
+    "criticality_rank": {
+      "unknown": 0,
+      "low": 1,
+      "medium": 2,
+      "high": 3
+    },
+    "delivery_rank": {
+      "low": 0,
+      "medium": 1,
+      "high": 2
+    },
+    "decision": {
+      "primary_values": [
+        "primary"
+      ],
+      "drop_values": [
+        "drop"
+      ],
+      "default": "secondary"
+    },
+    "weighted_top_limits": {
+      "roles": 6,
+      "facets": 10,
+      "layers": 10,
+      "stages": 8
+    },
+    "ignore_values": [
+      "unknown",
+      "noise"
+    ],
+    "signal": {
+      "decision_values": [
+        "primary"
+      ],
+      "delivery_values": [
+        "high"
+      ],
+      "criticality_values": [
+        "high"
+      ],
+      "roles": [
+        "requirement",
+        "decision",
+        "architecture",
+        "process",
+        "risk",
+        "metric"
+      ],
+      "flags": [
+        "has_decision",
+        "has_requirement",
+        "has_risk",
+        "has_metric",
+        "has_owner_or_dependency"
+      ],
+      "max_signal_chunks": 20
+    },
+    "score_weights": {
+      "base": 1.0,
+      "confidence": 1.0,
+      "delivery_value": {
+        "high": 1.0,
+        "medium": 0.5,
+        "low": 0.0
+      },
+      "criticality": {
+        "high": 1.0,
+        "medium": 0.5,
+        "low": 0.0,
+        "unknown": 0.0
+      },
+      "decision": {
+        "primary": 1.0,
+        "secondary": 0.0,
+        "drop": -1.0
+      },
+      "role": {
+        "noise": -0.5,
+        "unknown": -0.5
+      }
+    }
+  },
+  "metadata_fields": {
+    "role": {
+      "payload": "evidence_role",
+      "prompt_label": "evidence_role",
+      "values_ref": "metadata_schema.evidence_role",
+      "kind": "enum",
+      "default": "unknown"
+    },
+    "facets": {
+      "payload": "evidence_facets",
+      "prompt_label": "evidence_facets",
+      "values_ref": "metadata_schema.evidence_facets",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "layers": {
+      "payload": "delivery_layers",
+      "prompt_label": "delivery_layers",
+      "values_ref": "metadata_schema.delivery_layers",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "stages": {
+      "payload": "delivery_stages",
+      "prompt_label": "delivery_stages",
+      "values_ref": "metadata_schema.delivery_stages",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "criticality": {
+      "payload": "business_impact",
+      "prompt_label": "business_impact",
+      "values_ref": "metadata_schema.business_impact",
+      "kind": "enum",
+      "default": "unknown"
+    },
+    "delivery_value": {
+      "payload": "delivery_value",
+      "prompt_label": "delivery_value",
+      "values_ref": "metadata_schema.delivery_value",
+      "kind": "enum",
+      "default": "low"
+    },
+    "decision": {
+      "payload": "evidence_decision",
+      "prompt_label": "evidence_decision",
+      "values_ref": "metadata_schema.evidence_decision",
+      "kind": "enum",
+      "default": "secondary"
+    }
+  }
+}

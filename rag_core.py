@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Shared dense-retrieval core for the local ADAS / Embedded Vision Delivery RAG v1.
+Shared dense-retrieval core for the local Domain Delivery RAG.
 
 This module is the single source of truth for the v1 runtime retrieval contract.
 
 Scope note:
-  Query-profile rules and metadata-prior weights are loaded from the active
-  domain config. Ingest ontology is still domain-specific in code and is
-  expected to move into the domain pack in a later refactor.
+  Query-profile rules, metadata-prior weights, answer contract, and metadata
+  field mapping are loaded from the active domain config.
 
 Runtime contract:
 
@@ -88,6 +87,73 @@ METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
+
+DEFAULT_METADATA_FIELD_MAP = {
+    "role": "chunk_role",
+    "facets": "content_facets",
+    "layers": "system_layers",
+    "stages": "workflow_stages",
+    "criticality": "safety_relevance",
+    "delivery_value": "delivery_value",
+    "decision": "corpus_decision",
+}
+
+
+def metadata_field(logical_name: str, default: str | None = None) -> str:
+    """Return the payload field name for a logical metadata concept.
+
+    ADAS keeps the legacy payload fields such as safety_relevance and
+    system_layers. Other domain packs may map the same logical concepts to
+    different payload names without changing the retrieval engine code.
+    """
+    field_map = dict(DEFAULT_METADATA_FIELD_MAP)
+    field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
+    fallback = default if default is not None else logical_name
+    value = field_map.get(logical_name, fallback)
+    return str(value or fallback)
+
+
+def metadata_fields_config() -> dict[str, Any]:
+    return dict(getattr(DOMAIN, "metadata_fields", {}) or {})
+
+
+def boolean_flag_fields() -> list[str]:
+    schema = getattr(DOMAIN, "metadata_schema", {}) or {}
+    flags = schema.get("boolean_flags") or []
+    return [str(flag) for flag in flags]
+
+
+def payload_metadata(payload: dict[str, Any], logical_name: str, default_field: str | None = None, default: Any = None) -> Any:
+    return payload.get(metadata_field(logical_name, default_field), default)
+
+
+def payload_decision(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "decision", "corpus_decision")
+
+
+def payload_delivery_value(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "delivery_value", "delivery_value")
+
+
+def payload_criticality(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "criticality", "safety_relevance")
+
+
+def payload_role(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "role", "chunk_role")
+
+
+def payload_facets(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "facets", "content_facets")
+
+
+def payload_layers(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "layers", "system_layers")
+
+
+def payload_stages(payload: dict[str, Any]) -> Any:
+    return payload_metadata(payload, "stages", "workflow_stages")
+
 
 DEFAULT_ANSWER_GROUNDING_RULES = [
     "Use the retrieved context first.",
@@ -365,6 +431,22 @@ def _hit_weight(hit_cfg: dict[str, Any], hits: int) -> float:
     return min(hits * per_hit, cap)
 
 
+def _value_weight_for(
+    weights: dict[str, Any],
+    logical_name: str,
+    default_field: str,
+    payload: dict[str, Any],
+) -> float:
+    field = metadata_field(logical_name, default_field)
+    value = payload.get(field)
+
+    # Prefer the concrete payload field name so existing ADAS configs preserve
+    # byte-for-byte weight semantics. Allow future domain packs to key weights by
+    # logical concept name as a fallback.
+    key = field if field in weights else logical_name
+    return _value_weight(weights, key, value)
+
+
 def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     """
     Bounded heuristic rerank.
@@ -372,18 +454,18 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     Classification metadata is a routing/ranking signal only. It is not placed in
     answer evidence and should not be cited by the model.
 
-    The mechanism is generic; the weights are domain policy and are loaded from
-    the active domain config.
+    The mechanism is generic; the weights and metadata field mapping are domain
+    policy loaded from the active domain config.
     """
     bonus = 0.0
     rerank = RERANK_CONFIG
     base_weights = rerank.get("base_weights", {})
     hit_weights = rerank.get("hit_weights", {})
 
-    bonus += _value_weight(base_weights, "corpus_decision", payload.get("corpus_decision"))
-    bonus += _value_weight(base_weights, "delivery_value", payload.get("delivery_value"))
-    bonus += _value_weight(base_weights, "safety_relevance", payload.get("safety_relevance"))
-    bonus += _value_weight(base_weights, "chunk_role", payload.get("chunk_role"))
+    bonus += _value_weight_for(base_weights, "decision", "corpus_decision", payload)
+    bonus += _value_weight_for(base_weights, "delivery_value", "delivery_value", payload)
+    bonus += _value_weight_for(base_weights, "criticality", "safety_relevance", payload)
+    bonus += _value_weight_for(base_weights, "role", "chunk_role", payload)
 
     try:
         confidence_weight = float(rerank.get("confidence_weight", 0.0))
@@ -393,10 +475,10 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
 
     profile = query_profile(query)
 
-    role_hits = _intersect_count(payload.get("chunk_role"), profile["roles"])
-    facet_hits = _intersect_count(payload.get("content_facets"), profile["facets"])
-    layer_hits = _intersect_count(payload.get("system_layers"), profile["layers"])
-    stage_hits = _intersect_count(payload.get("workflow_stages"), profile["stages"])
+    role_hits = _intersect_count(payload_role(payload), profile["roles"])
+    facet_hits = _intersect_count(payload_facets(payload), profile["facets"])
+    layer_hits = _intersect_count(payload_layers(payload), profile["layers"])
+    stage_hits = _intersect_count(payload_stages(payload), profile["stages"])
 
     bonus += _hit_weight(hit_weights.get("role", {}), role_hits)
     bonus += _hit_weight(hit_weights.get("facet", {}), facet_hits)
@@ -409,7 +491,6 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
             bonus += flag_weight
 
     return _clamp(bonus, META_MIN, META_MAX)
-
 
 # =============================================================================
 # Dense retrieval and neighbor expansion

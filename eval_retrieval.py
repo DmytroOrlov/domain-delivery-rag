@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Retrieval-only eval for the local ADAS / Embedded Vision Delivery RAG v1.
+Retrieval-only eval for the local Domain Delivery RAG.
 
 This is intentionally NOT an answer-quality eval. It checks whether the shared
 retrieval/context path can find expected source files/chunks and avoids forbidden
@@ -221,7 +221,7 @@ def validate_case(case: dict[str, Any], selected: list[dict[str, Any]], groups: 
     # was enabled or the collection is stale/misconfigured.
     for item in expanded_items:
         p = item["payload"]
-        if p.get("corpus_decision") == "drop":
+        if rc.payload_decision(p) == "drop":
             failures.append(
                 f"drop chunk retrieved: {rc.file_name(p)}:#{p.get('chunk_index')} "
                 "(drop means exclude from index by default)"
@@ -267,11 +267,11 @@ def print_case_result(case: dict[str, Any], selected: list[dict[str, Any]], grou
             f"meta={rc.fmt_score(item.get('meta_bonus'))} "
             f"file={rc.file_name(p)} "
             f"chunk={p.get('chunk_index')} "
-            f"role={p.get('chunk_role')} "
-            f"facets={p.get('content_facets')} "
-            f"safety={p.get('safety_relevance')} "
-            f"delivery={p.get('delivery_value')} "
-            f"decision={p.get('corpus_decision')}"
+            f"role={rc.payload_role(p)} "
+            f"facets={rc.payload_facets(p)} "
+            f"criticality={rc.payload_criticality(p)} "
+            f"delivery={rc.payload_delivery_value(p)} "
+            f"decision={rc.payload_decision(p)}"
         )
     print()
 

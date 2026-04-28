@@ -1,106 +1,47 @@
 #!/usr/bin/env python3
 """
-Minimal reverse-proxy RAG UX for the stock llama.cpp browser chat.
+Reverse proxy RAG UX for the stock llama.cpp browser chat.
 
-Scope: local ADAS / embedded vision delivery RAG v1. This proxy is deliberately
-narrow and does not attempt to be a general OpenAI-compatible middleware.
+Why this exists:
+- We want to use the nice llama-server browser UI at /#/ without patching
+  llama.cpp.
+- The proxy forwards everything to llama-server unchanged except explicit
+  `/rag` chat messages.
+- `/rag` messages are rewritten into an evidence-only RAG prompt using the
+  shared retrieval/context contract from rag_core.py.
 
-Why this exists
----------------
-We want to keep llama.cpp / llama-server unpatched and still use its browser UI.
-Open the browser through this proxy:
+Architecture:
+  Browser UI -> rag_proxy.py (:8088) -> llama-server chat (:8080)
+                                -> embedding server (:8081)
+                                -> Qdrant (:6333)
 
-    http://127.0.0.1:8088/#/
+User command:
+  /rag 5
+  What are the likely warning-related and safety-relevant implications ...
 
-The proxy forwards every request to the upstream llama-server, except for one
-explicit, observed UI request shape:
+Behavior:
+  - proxy all HTTP paths/methods to llama-server
+  - preserve streaming responses
+  - inspect JSON chat requests
+  - if last user message starts with /rag:
+      parse top_k and question
+      call rag_core.build_augmented_prompt()
+      replace only that user message content
+      forward patched JSON to llama-server
 
-    POST /v1/chat/completions
-    Content-Type: application/json
-    {
-      "messages": [
-        {"role": "user", "content": "/rag 5\nquestion..."}
-      ],
-      ... other llama.cpp UI fields ...
-    }
+Security / privacy:
+  - Bind to 127.0.0.1 by default.
+  - Do not expose this proxy publicly.
+  - Logs may contain user questions and request previews.
+  - Full local source paths are not placed in the LLM prompt; source provenance
+    inside the prompt is limited to source id, file name, and chunk ids.
 
-Only in that exact chat/messages shape, if the last user message content is a
-plain string matching the newline-only /rag command, the proxy replaces that
-single user message content with a RAG-augmented prompt built by rag_core.py.
-Everything else in the JSON request is preserved unchanged.
-
-Supported /rag command contract
--------------------------------
-Supported:
-
-    /rag 5
-    What are the likely warning-related implications ...
-
-    /rag
-    What are the likely warning-related implications ...
-
-Not supported intentionally:
-
-    /rag 5 question on one line
-    prompt=... request shapes
-    content=... request shapes
-    non-JSON /rag bodies
-    multimodal/content-parts message shapes
-
-This is deliberate. The goal is not to invent a generic OpenAI-compatible RAG
-middleware. The goal is to minimally patch the exact llama.cpp browser UI traffic
-observed in this project.
-
-What the proxy changes
-----------------------
-For a detected /rag request:
-
-    data["messages"][last_user_index]["content"] = augmented_prompt
-
-What the proxy does NOT change
-------------------------------
-It does not modify:
-
-    stream
-    return_progress
-    backend_sampling
-    timings_per_token
-    temperature / sampling options
-    max_tokens / n_predict
-    model settings
-    any non-/rag request
-
-This matters for Qwen reasoning models: the browser UI already sends a working
-llama-server payload. The proxy must not second-guess or override it.
-
-Architecture
-------------
-    Browser UI -> rag_proxy.py (:8088) -> llama-server chat (:8080)
-                                  -> rag_core.py retrieval/context packing + domain prompt rendering
-                                  -> embedding server (:8081)
-                                  -> Qdrant (:6333)
-
-Runtime semantics
------------------
-    - Retrieval mode is the dense baseline from rag_core.py.
-    - Hybrid lexical/RRF is deferred because the naive version hurt broad
-      semantic queries in this corpus.
-    - Classification metadata may be used by rag_core for ranking/diagnostics,
-      but classification metadata is not included as answer evidence.
-    - Full local source paths are not placed in the LLM prompt; prompt
-      provenance uses source id, file name, and chunk ids.
-    - The answer persona/citation/section contract is rendered by rag_core
-      from the active domain config.
-
-Security / privacy
-------------------
-    - Bind to 127.0.0.1 by default.
-    - Do not expose this proxy publicly.
-    - Logs may contain user questions and request previews.
-
-Run
----
-    RAG_LLAMA_URL=http://127.0.0.1:8080 python3 rag_proxy.py
+Important semantics:
+  - Current runtime uses the proven dense retrieval baseline.
+  - Hybrid lexical/RRF is intentionally deferred because the naive version hurt
+    broad semantic queries.
+  - Classification metadata is used only by retrieval/reranking diagnostics, not
+    as answer evidence.
 """
 
 from __future__ import annotations
@@ -123,9 +64,16 @@ from starlette.responses import Response, StreamingResponse
 
 import rag_core as rc
 
+# =============================================================================
+# Proxy config
+# =============================================================================
+
 LLAMA_URL = os.environ.get("RAG_LLAMA_URL", "http://127.0.0.1:8080").rstrip("/")
 PROXY_HOST = os.environ.get("RAG_PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("RAG_PROXY_PORT", "8088"))
+
+# Default: active rewrite. Use RAG_PROXY_DRY_RUN=1 to only detect/log /rag.
+DRY_RUN = os.environ.get("RAG_PROXY_DRY_RUN", "0") == "1"
 
 RAG_COMMAND = os.environ.get("RAG_COMMAND", "/rag")
 DEFAULT_RAG_K = int(os.environ.get("RAG_DEFAULT_K", str(rc.DEFAULT_TOP_K)))
@@ -140,6 +88,11 @@ if READ_TIMEOUT.lower() in {"none", "null", "0", "-1"}:
     READ_TIMEOUT_VALUE = None
 else:
     READ_TIMEOUT_VALUE = float(READ_TIMEOUT)
+
+
+# =============================================================================
+# HTTP proxy header rules
+# =============================================================================
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -158,6 +111,10 @@ STRIP_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {"accept-encoding"}
 STRIP_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {"content-length"}
 
 
+# =============================================================================
+# Logging helpers
+# =============================================================================
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -174,34 +131,44 @@ def log(request_id: str, msg: str) -> None:
     print(f"[rag-proxy {request_id}] {msg}", flush=True)
 
 
+def safe_decode_body(body: bytes) -> str:
+    try:
+        return body.decode("utf-8", errors="replace")
+    except Exception:
+        return repr(body)
+
+
+# =============================================================================
+# /rag parser and chat payload helpers
+# =============================================================================
+
 def parse_rag_command(text: str):
     """
-    Parse only the newline command format used in the llama.cpp browser UI.
-
-    Accepted:
-        /rag 5\nquestion...
-        /rag\nquestion...
-
-    Rejected intentionally:
-        /rag 5 question...
-        bare /rag without a question
+    Supports both preferred newline format and one-line fallback:
+      /rag 5\nquestion
+      /rag\nquestion
+      /rag 5 question
     """
     if not isinstance(text, str):
         return None
 
     command = re.escape(RAG_COMMAND)
-    pattern = rf"^\s*{command}(?:\s+(\d+))?\s*\n([\s\S]+?)\s*$"
-    match = re.match(pattern, text, flags=re.IGNORECASE)
-    if not match:
-        return None
+    pattern = rf"^\s*{command}(?:\s+(\d+))?(?:\s*\n|\s+)([\s\S]*?)\s*$"
+    m = re.match(pattern, text, flags=re.IGNORECASE)
 
-    question = match.group(2).strip()
-    if not question:
-        return None
+    if not m:
+        bare = re.match(rf"^\s*{command}(?:\s+(\d+))?\s*$", text, flags=re.IGNORECASE)
+        if not bare:
+            return None
+        return {
+            "top_k": int(bare.group(1) or DEFAULT_RAG_K),
+            "question": "",
+            "raw": text,
+        }
 
     return {
-        "top_k": int(match.group(1) or DEFAULT_RAG_K),
-        "question": question,
+        "top_k": int(m.group(1) or DEFAULT_RAG_K),
+        "question": m.group(2).strip(),
         "raw": text,
     }
 
@@ -214,44 +181,181 @@ def find_last_user_message(messages: list[dict[str, Any]]):
     return None, None
 
 
-def detect_llama_ui_rag_request(path: str, method: str, data: Any):
-    """
-    Detect only the observed llama.cpp browser UI RAG request shape.
+def extract_text_from_message_content(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        if parts:
+            return "\n".join(parts)
+    return None
 
-    This intentionally ignores other OpenAI-compatible shapes so the proxy stays
-    minimal and predictable.
-    """
-    if method.upper() != "POST":
-        return None
 
-    if path.strip("/") != "v1/chat/completions":
-        return None
+def replace_message_content(message: dict[str, Any], new_text: str):
+    """Preserve OpenAI-compatible content shape where possible."""
+    content = message.get("content")
 
+    if isinstance(content, str):
+        message["content"] = new_text
+        return
+
+    if isinstance(content, list):
+        replaced = False
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and not replaced:
+                new_part = dict(part)
+                new_part["text"] = new_text
+                new_parts.append(new_part)
+                replaced = True
+            else:
+                new_parts.append(part)
+        if not replaced:
+            new_parts.insert(0, {"type": "text", "text": new_text})
+        message["content"] = new_parts
+        return
+
+    message["content"] = new_text
+
+
+def detect_rag_in_json(data: Any):
+    """Return detection dict for common OpenAI/llama.cpp request shapes."""
     if not isinstance(data, dict):
         return None
 
     messages = data.get("messages")
-    if not isinstance(messages, list):
-        return None
+    if isinstance(messages, list):
+        idx, msg = find_last_user_message(messages)
+        if msg is not None:
+            content_text = extract_text_from_message_content(msg.get("content"))
+            parsed = parse_rag_command(content_text or "")
+            if parsed:
+                return {
+                    "shape": "messages",
+                    "message_index": idx,
+                    "top_k": parsed["top_k"],
+                    "question": parsed["question"],
+                    "roles": [m.get("role", "?") if isinstance(m, dict) else "?" for m in messages],
+                }
 
-    idx, msg = find_last_user_message(messages)
-    if msg is None:
-        return None
+    prompt = data.get("prompt")
+    if isinstance(prompt, str):
+        parsed = parse_rag_command(prompt)
+        if parsed:
+            return {"shape": "prompt", "message_index": None, "top_k": parsed["top_k"], "question": parsed["question"], "roles": []}
 
-    content = msg.get("content")
-    if not isinstance(content, str):
-        return None
+    content = data.get("content")
+    if isinstance(content, str):
+        parsed = parse_rag_command(content)
+        if parsed:
+            return {"shape": "content", "message_index": None, "top_k": parsed["top_k"], "question": parsed["question"], "roles": []}
 
-    parsed = parse_rag_command(content)
-    if not parsed:
-        return None
+    return None
 
-    return {
-        "message_index": idx,
-        "top_k": parsed["top_k"],
-        "question": parsed["question"],
-        "roles": [m.get("role", "?") if isinstance(m, dict) else "?" for m in messages],
-    }
+
+# =============================================================================
+# JSON request patching
+# =============================================================================
+
+async def maybe_patch_json_body(request_id: str, path: str, data: Any):
+    detection = detect_rag_in_json(data)
+    if not detection:
+        return data, False
+
+    top_k = detection["top_k"]
+    question = detection["question"]
+
+    log(
+        request_id,
+        "RAG_DETECTED "
+        f"path=/{path} "
+        f"shape={detection['shape']} "
+        f"message_index={detection['message_index']} "
+        f"top_k={top_k} "
+        f"question_preview={short(question, 300)!r} "
+        f"roles={detection.get('roles', [])}",
+    )
+
+    if not question.strip():
+        raise ValueError("RAG command detected, but question is empty")
+
+    if DRY_RUN:
+        log(request_id, "RAG_DRY_RUN active: request body is NOT modified")
+        return data, True
+
+    # Copy request JSON without mutating the object retained by FastAPI/debug code.
+    patched = json.loads(json.dumps(data, ensure_ascii=False))
+
+    augmented, info = await asyncio.to_thread(
+        rc.build_augmented_prompt,
+        question,
+        top_k,
+        rc.DEFAULT_PRE_K,
+        rc.DEFAULT_MAX_PER_FILE,
+        rc.DEFAULT_NEIGHBOR_RADIUS,
+        rc.SELECTED_MAX_CHARS,
+        rc.NEIGHBOR_SNIPPET_CHARS,
+        rc.CONTEXT_MAX_CHARS,
+    )
+
+    log(
+        request_id,
+        "RAG_RETRIEVE "
+        f"top_k={info['top_k']} "
+        f"pre_k={info['pre_k']} "
+        f"selected={info['selected_count']} "
+        f"source_groups={info['source_groups_count']} "
+        f"context_chars={info['context_chars']} "
+        f"prompt_chars={info['prompt_chars']} "
+        f"candidates={info['candidates_count']}",
+    )
+
+    for idx, group in enumerate(info["source_groups"], start=1):
+        log(
+            request_id,
+            "RAG_SOURCE "
+            f"S{idx} file={group.get('file_name')} "
+            f"selected={group.get('selected_indices')} "
+            f"expanded={group.get('expanded_indices')} "
+            f"best_final={rc.fmt_score(group.get('best_final_score'))}",
+        )
+
+    shape = detection["shape"]
+    if shape == "messages":
+        idx = detection["message_index"]
+        replace_message_content(patched["messages"][idx], augmented)
+    elif shape == "prompt":
+        patched["prompt"] = augmented
+    elif shape == "content":
+        patched["content"] = augmented
+    else:
+        raise ValueError(f"Unsupported RAG detection shape: {shape}")
+
+    log(
+        request_id,
+        "RAG_REWRITE "
+        f"old_question_chars={len(question)} "
+        f"new_prompt_chars={len(augmented)} "
+        "full_paths_in_prompt=False "
+        "classification_metadata_in_prompt=False",
+    )
+
+    return patched, True
+
+
+# =============================================================================
+# HTTP proxy helpers
+# =============================================================================
+
+def filter_request_headers(headers) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in STRIP_REQUEST_HEADERS}
+
+
+def filter_response_headers(headers) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS}
 
 
 def should_try_json(content_type: str, body: bytes) -> bool:
@@ -264,24 +368,6 @@ def should_try_json(content_type: str, body: bytes) -> bool:
     return stripped.startswith(b"{") or stripped.startswith(b"[")
 
 
-def filter_request_headers(headers) -> dict[str, str]:
-    out = {}
-    for key, value in headers.items():
-        if key.lower() in STRIP_REQUEST_HEADERS:
-            continue
-        out[key] = value
-    return out
-
-
-def filter_response_headers(headers) -> dict[str, str]:
-    out = {}
-    for key, value in headers.items():
-        if key.lower() in STRIP_RESPONSE_HEADERS:
-            continue
-        out[key] = value
-    return out
-
-
 def target_url(path: str, query_string: bytes) -> str:
     url = f"{LLAMA_URL}/{path}"
     if query_string:
@@ -289,56 +375,9 @@ def target_url(path: str, query_string: bytes) -> str:
     return url
 
 
-async def patch_json_body_if_rag(request_id: str, path: str, method: str, data: Any):
-    detection = detect_llama_ui_rag_request(path=path, method=method, data=data)
-    if not detection:
-        return data, False
-
-    top_k = detection["top_k"]
-    question = detection["question"]
-
-    log(
-        request_id,
-        "RAG_DETECTED "
-        f"path=/{path} "
-        f"message_index={detection['message_index']} "
-        f"top_k={top_k} "
-        f"question_preview={short(question, 300)!r} "
-        f"roles={detection.get('roles', [])}",
-    )
-
-    patched = json.loads(json.dumps(data, ensure_ascii=False))
-
-    prompt, debug_info = await asyncio.to_thread(
-        rc.build_augmented_prompt,
-        question=question,
-        top_k=top_k,
-    )
-
-    for idx, group in enumerate(debug_info.get("source_groups", []), start=1):
-        log(
-            request_id,
-            "RAG_SOURCE "
-            f"S{idx} file={group.get('file_name')} "
-            f"selected={group.get('selected_indices')} "
-            f"expanded={group.get('expanded_indices')} "
-            f"best_final={rc.fmt_score(group.get('best_final_score'))}",
-        )
-
-    patched["messages"][detection["message_index"]]["content"] = prompt
-
-    log(
-        request_id,
-        "RAG_REWRITE "
-        f"old_question_chars={len(question)} "
-        f"new_prompt_chars={len(prompt)} "
-        f"context_chars={debug_info.get('context_chars')} "
-        "full_paths_in_prompt=False "
-        "classification_metadata_in_prompt=False",
-    )
-
-    return patched, True
-
+# =============================================================================
+# FastAPI app
+# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -356,13 +395,19 @@ async def lifespan(app: FastAPI):
     print("=" * 100)
     print(f"Proxy URL:        http://{PROXY_HOST}:{PROXY_PORT}")
     print(f"Upstream llama:   {LLAMA_URL}")
-    print(f"Patch contract:   only POST /v1/chat/completions messages[last user].content")
-    print(f"Command format:   newline-only '/rag [k]\\nquestion' (one-line commands ignored)")
-    print(f"Payload policy:   preserve all non-content JSON fields; do not touch sampling/stream/server options")
+    print(f"RAG command:      {RAG_COMMAND}")
+    print(f"Default RAG k:    {DEFAULT_RAG_K}")
+    print(f"Dry run:          {DRY_RUN}")
     print(f"Retrieval mode:   {cfg['mode']} (hybrid {cfg['hybrid']})")
-    print(f"Collection:       {cfg['collection']}")
-    print(f"Qdrant URL:       {cfg['qdrant_url']}")
     print(f"Embedding URL:    {cfg['embed_url']}")
+    print(f"Qdrant URL:       {cfg['qdrant_url']}")
+    print(f"Collection:       {cfg['collection']}")
+    print(f"RAG pre_k:        {cfg['pre_k']}")
+    print(f"RAG max_per_file: {cfg['max_per_file']}")
+    print(f"Neighbor radius:  {cfg['neighbor_radius']}")
+    print(f"Context max chars:{cfg['context_max_chars']}")
+    print(f"Metadata clamp:   {cfg['metadata_rerank_clamp']}")
+    print("Prompt policy:    full_paths=False; classification_metadata=False")
     print(f"Read timeout:     {READ_TIMEOUT_VALUE}")
     print("=" * 100, flush=True)
 
@@ -375,10 +420,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@app.api_route(
-    "/{path:path}",
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-)
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_all(path: str, request: Request):
     request_id = uuid.uuid4().hex[:8]
     t0 = now_ms()
@@ -388,44 +430,43 @@ async def proxy_all(path: str, request: Request):
     body = await request.body()
     content_type = request.headers.get("content-type", "")
 
-    log(
-        request_id,
-        f"IN {method} /{path} "
-        f"query={request.url.query!r} "
-        f"ct={content_type!r} "
-        f"body_bytes={len(body)}",
-    )
+    log(request_id, f"IN {method} /{path} query={request.url.query!r} ct={content_type!r} body_bytes={len(body)}")
 
     outbound_body = body
     body_was_patched = False
+    rag_detected = False
 
     if should_try_json(content_type, body):
         try:
             data = json.loads(body.decode("utf-8", errors="replace"))
-            patched_data, body_was_patched = await patch_json_body_if_rag(
-                request_id=request_id,
-                path=path,
-                method=method,
-                data=data,
-            )
-            if body_was_patched:
-                outbound_body = json.dumps(
-                    patched_data,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                log(request_id, f"BODY_PREVIEW {short(body.decode('utf-8', errors='replace'))!r}")
-        except Exception as exc:
-            log(request_id, f"RAG_OR_JSON_PATCH_FAILED error={type(exc).__name__}: {exc}")
+            patched_data, rag_detected = await maybe_patch_json_body(request_id, path, data)
+            if rag_detected and not DRY_RUN:
+                outbound_body = json.dumps(patched_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                body_was_patched = True
+        except Exception as e:
+            log(request_id, f"RAG_OR_JSON_PATCH_FAILED error={type(e).__name__}: {e}")
             return Response(
                 content=(
                     "rag_proxy RAG preprocessing error\n"
                     f"path=/{path}\n"
-                    f"error={type(exc).__name__}: {exc}\n"
+                    f"error={type(e).__name__}: {e}\n"
                 ),
                 status_code=500,
                 media_type="text/plain",
             )
+    elif body and len(body) < 64_000:
+        parsed = parse_rag_command(safe_decode_body(body))
+        if parsed:
+            rag_detected = True
+            log(
+                request_id,
+                "RAG_DETECTED_NON_JSON "
+                f"path=/{path} top_k={parsed['top_k']} "
+                f"question_preview={short(parsed['question'], 300)!r}",
+            )
+
+    if rag_detected:
+        log(request_id, f"BODY_PREVIEW {short(safe_decode_body(body))!r}")
 
     upstream_headers = filter_request_headers(request.headers)
     if body_was_patched:
@@ -434,22 +475,13 @@ async def proxy_all(path: str, request: Request):
     client: httpx.AsyncClient = request.app.state.client
 
     try:
-        upstream_request = client.build_request(
-            method=method,
-            url=url,
-            headers=upstream_headers,
-            content=outbound_body,
-        )
+        upstream_request = client.build_request(method=method, url=url, headers=upstream_headers, content=outbound_body)
         upstream_response = await client.send(upstream_request, stream=True)
-    except httpx.RequestError as exc:
+    except httpx.RequestError as e:
         elapsed = now_ms() - t0
-        log(request_id, f"UPSTREAM_ERROR after_ms={elapsed} error={type(exc).__name__}: {exc}")
+        log(request_id, f"UPSTREAM_ERROR after_ms={elapsed} error={type(e).__name__}: {e}")
         return Response(
-            content=(
-                "rag_proxy upstream error\n"
-                f"target={url}\n"
-                f"error={type(exc).__name__}: {exc}\n"
-            ),
+            content=("rag_proxy upstream error\n" f"target={url}\n" f"error={type(e).__name__}: {e}\n"),
             status_code=502,
             media_type="text/plain",
         )
@@ -458,10 +490,8 @@ async def proxy_all(path: str, request: Request):
     elapsed = now_ms() - t0
     log(
         request_id,
-        f"OUT status={upstream_response.status_code} "
-        f"after_ms={elapsed} "
-        f"upstream_ct={upstream_response.headers.get('content-type')!r} "
-        f"streaming=True",
+        f"OUT status={upstream_response.status_code} after_ms={elapsed} "
+        f"upstream_ct={upstream_response.headers.get('content-type')!r} streaming=True",
     )
 
     async def response_stream():
@@ -471,8 +501,8 @@ async def proxy_all(path: str, request: Request):
         except asyncio.CancelledError:
             log(request_id, "STREAM_CANCELLED client disconnected")
             raise
-        except Exception as exc:
-            log(request_id, f"STREAM_ERROR {type(exc).__name__}: {exc}")
+        except Exception as e:
+            log(request_id, f"STREAM_ERROR {type(e).__name__}: {e}")
             raise
 
     return StreamingResponse(
@@ -483,7 +513,7 @@ async def proxy_all(path: str, request: Request):
     )
 
 
-def main() -> None:
+def main():
     try:
         uvicorn.run(
             app,

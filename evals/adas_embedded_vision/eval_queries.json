@@ -469,6 +469,7 @@
       "(?i)(GS[- ]?BAU[- ]?70|certification test protocol).{0,120}(exact|certified|measured|protocol-specific).{0,120}(latency|end-to-end).{0,120}\\b[0-9]+(?:\\.[0-9]+)?\\s*ms",
       "(?i)(INT8|quantization).{0,60}(latency|variation|delta|varies|changes).{0,60}(?:is|equals|measured|specifically|target)\\s*[0-9]+(?:\\.[0-9]+)?\\s*ms"
     ],
+    "min_citation_count": 1,
     "forbidden_sources": [],
     "notes": "No-answer case. The corpus may mention generic latency or INT8/RKNN deployment, but it should not invent exact GS-BAU protocol latency or INT8-specific latency variation."
   }

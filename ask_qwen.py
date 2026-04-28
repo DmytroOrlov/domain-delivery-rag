@@ -146,11 +146,11 @@ def print_source_groups(debug_info: dict[str, Any]) -> None:
                 f"mode={mode} "
                 f"final={rc.fmt_score(item.get('final_score'))} "
                 f"dense_rank={item.get('dense_rank') if item.get('dense_rank') is not None else '-'} "
-                f"role={payload.get('chunk_role')} "
-                f"facets={rc.fmt_list(payload.get('content_facets'))} "
-                f"safety={payload.get('safety_relevance')} "
-                f"delivery={payload.get('delivery_value')} "
-                f"decision={payload.get('corpus_decision')}"
+                f"role={rc.payload_role(payload)} "
+                f"facets={rc.fmt_list(rc.payload_facets(payload))} "
+                f"criticality={rc.payload_criticality(payload)} "
+                f"delivery={rc.payload_delivery_value(payload)} "
+                f"decision={rc.payload_decision(payload)}"
             )
     print()
     print("Context summary:")
@@ -178,7 +178,6 @@ def main() -> None:
     print("=" * 100)
     print("RAG ASK DEBUG START")
     print("=" * 100)
-    print(f"Domain: {cfg.get('domain_id')} ({cfg.get('domain_display_name')})")
     print(f"Question: {question}")
     print(f"Chat URL: {CHAT_URL}")
     print(f"Retrieval mode: {cfg['mode']} (hybrid {cfg['hybrid']})")

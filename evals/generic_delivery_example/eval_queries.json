@@ -1,0 +1,26 @@
+[
+  {
+    "id": "generic_delivery_risk_owner_metrics",
+    "query": "What risks, owners, and metrics are described for the launch plan?",
+    "top_k": 5,
+    "expected_sources_all": [
+      "delivery_notes"
+    ],
+    "expected_selected_chunks_any": [
+      {
+        "source": "delivery_notes",
+        "chunks": [0]
+      }
+    ],
+    "expected_expanded_chunks_any": [
+      {
+        "source": "delivery_notes",
+        "chunks": [0]
+      }
+    ],
+    "min_answer_chars": 250,
+    "min_citation_count": 1,
+    "forbidden_sources": [],
+    "notes": "Non-ADAS smoke case. It checks alias resolution, selected/expanded chunk expectations, and answer-eval overrides for a tiny generic delivery note without ADAS/safety field names."
+  }
+]

@@ -1,0 +1,13 @@
+# Launch Readiness Notes
+
+## Decision and owner
+The payment migration launch decision is gated by the release owner and the operations lead.
+The owner must confirm that the rollback runbook is reviewed before launch.
+
+## Risks and blockers
+The main blocker is an unresolved dependency on the billing export job.
+A secondary risk is support-volume growth after the migration announcement.
+
+## Metrics
+The review uses three metrics: migration success rate, support ticket volume, and rollback time.
+The target is to keep rollback time under 30 minutes during the launch window.

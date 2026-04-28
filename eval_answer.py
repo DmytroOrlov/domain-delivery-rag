@@ -16,7 +16,7 @@ import requests
 import rag_core as rc
 
 # =============================================================================
-# ADAS / Embedded Vision Delivery RAG - Answer Contract Eval
+# Domain Delivery RAG - Answer Contract Eval
 # =============================================================================
 #
 # Purpose:
@@ -26,15 +26,14 @@ import rag_core as rc
 # that catches answer-contract regressions and obvious grounding hygiene issues.
 #
 # What this eval checks:
-#   - the answer has the required six-section structure;
+#   - the answer has the sections required by the active domain answer contract;
 #   - no-answer/insufficient-evidence cases explicitly abstain instead of
-#     inventing thresholds, ASIL/SIL assignments, or formal safety goals;
+#     inventing unsupported values or domain-specific assignments;
 #   - the answer cites retrieved sources as [S1], [S2], ...;
 #   - visible reasoning does not remain in the final parsed answer;
 #   - raw /rag command does not leak;
 #   - full local paths do not leak;
-#   - classification metadata (chunk_role, content_facets, reason_short, etc.)
-#     does not appear as answer evidence.
+#   - classification metadata from the active domain config does not appear as answer evidence.
 #
 # Qwen / llama-server contract:
 #   This script does not send server-side response-routing overrides.
@@ -52,7 +51,7 @@ import rag_core as rc
 #   narrowly parsed final answer:
 #     - if </think> appears, keep only text after the last </think>;
 #     - otherwise keep message.content as-is;
-#     - then, if needed, trim to the requested "1. Conclusion" section start.
+#     - then, if needed, trim to the first configured answer section.
 #
 #   This is parsing the default model response, not changing llama-server
 #   behavior. A malformed unclosed <think> remains a hard failure.
@@ -83,6 +82,7 @@ DEFAULT_TOP_K = int(os.environ.get("RAG_ANSWER_EVAL_TOP_K", "5"))
 
 MIN_ANSWER_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CHARS", "600"))
 MIN_CITATION_COUNT = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CITATIONS", "2"))
+STRICT_CITATION_FORMAT = os.environ.get("RAG_ANSWER_EVAL_STRICT_CITATIONS", "0") == "1"
 
 VERBOSE = os.environ.get("RAG_ANSWER_EVAL_VERBOSE", "1") != "0"
 SAVE_PROMPTS = os.environ.get("RAG_ANSWER_EVAL_SAVE_PROMPTS", "1") != "0"
@@ -90,7 +90,7 @@ SAVE_PROMPTS = os.environ.get("RAG_ANSWER_EVAL_SAVE_PROMPTS", "1") != "0"
 # Eval-only guardrail. This does not change retrieval; it prevents one stochastic
 # malformed generation (loop/truncation/missing citation format) from making the
 # whole regression gate noisy. Set to 0 to evaluate first-shot compliance only.
-REPAIR_ON_CONTRACT_FAILURE = os.environ.get("RAG_ANSWER_EVAL_REPAIR_ON_CONTRACT_FAILURE", "1") != "0"
+REPAIR_ON_CONTRACT_FAILURE = os.environ.get("RAG_ANSWER_EVAL_REPAIR_ON_CONTRACT_FAILURE", "0") != "0"
 MAX_REPAIR_ATTEMPTS = int(os.environ.get("RAG_ANSWER_EVAL_REPAIR_ATTEMPTS", "1"))
 
 # Optional deterministic sampling for answer eval only. By default we do not send
@@ -247,17 +247,47 @@ def call_chat(prompt: str):
 #   1. Conclusion
 #   1. **Conclusion**
 #   ### 1. Conclusion
-# The eval is checking the answer contract, not enforcing one exact Markdown style.
-# We still require the section number + section title, but allow optional Markdown
-# heading markers and bold markers around the title.
-REQUIRED_SECTION_PATTERNS = [
-    ("conclusion", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?1[.)]\s*(?:\*\*\s*)?conclusion\b(?:\s*\*\*)?"),
-    ("supported_facts", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?2[.)]\s*(?:\*\*\s*)?supported facts\b(?:\s*\*\*)?"),
-    ("inferences", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?3[.)]\s*(?:\*\*\s*)?inferences\b(?:\s*\*\*)?"),
-    ("implementation_implications", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?4[.)]\s*(?:\*\*\s*)?implementation implications\b(?:\s*\*\*)?"),
-    ("unknowns", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?5[.)]\s*(?:\*\*\s*)?unknowns\s*/\s*verification needed\b(?:\s*\*\*)?"),
-    ("source_mapping", r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*\s*)?6[.)]\s*(?:\*\*\s*)?source mapping\b(?:\s*\*\*)?"),
-]
+# Section titles are now derived from the active domain answer contract instead
+# of being hardcoded to the ADAS/current six-section layout.
+def _section_key(title: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+    return key or "section"
+
+
+def _section_title_regex(title: str) -> str:
+    # Escape the literal title but allow flexible whitespace and slash spacing.
+    parts = []
+    for ch in title.strip():
+        if ch.isspace():
+            parts.append(r"\s+")
+        elif ch == "/":
+            parts.append(r"\s*/\s*")
+        else:
+            parts.append(re.escape(ch))
+    return "".join(parts)
+
+
+def required_section_patterns() -> list[tuple[str, str]]:
+    try:
+        sections = rc.answer_sections()
+    except Exception:
+        sections = [
+            "Conclusion",
+            "Supported facts",
+            "Inferences",
+            "Implementation implications",
+            "Unknowns / verification needed",
+            "Source mapping",
+        ]
+
+    patterns = []
+    for idx, title in enumerate(sections, start=1):
+        title_re = _section_title_regex(title)
+        patterns.append((
+            _section_key(title),
+            rf"(?im)^\s*(?:#{{1,6}}\s*)?(?:\*\*\s*)?{idx}[.)]\s*(?:\*\*\s*)?{title_re}\b(?:\s*\*\*)?",
+        ))
+    return patterns
 
 REASONING_LEAK_PATTERNS = [
     r"<think>",
@@ -323,6 +353,34 @@ CLASSIFICATION_METADATA_LEAK_PATTERNS = [
 ]
 
 
+def classification_metadata_leak_patterns() -> list[str]:
+    patterns = list(CLASSIFICATION_METADATA_LEAK_PATTERNS)
+    dynamic_names = set()
+    try:
+        for logical_name, cfg in (rc.metadata_fields_config() or {}).items():
+            for key in ("payload", "prompt_label"):
+                value = cfg.get(key) if isinstance(cfg, dict) else None
+                if value:
+                    dynamic_names.add(str(value))
+
+        # Include document-level mapped payload names as classification metadata
+        # too. These are useful inside Qdrant payload/debug output, but final
+        # answers should cite source text rather than expose fields such as
+        # document_business_impact or document_evidence_decision.
+        for value in getattr(rc.DOMAIN, "metadata_field_map", {}).values():
+            if value:
+                dynamic_names.add(str(value))
+
+        dynamic_names.update(rc.boolean_flag_fields())
+    except Exception:
+        pass
+
+    for name in sorted(dynamic_names):
+        if name:
+            patterns.append(rf"\b{re.escape(name)}\b")
+    return patterns
+
+
 def normalize_answer_for_contract_checks(text: str) -> str:
     """Normalize lightweight Markdown that should not affect answer-contract checks.
 
@@ -348,15 +406,14 @@ def collect_regex_hits(text: str, patterns: list[str]):
 def citation_ids(answer: str):
     """Extract source citation ids from bracketed RAG citations.
 
-    Canonical output is still [S1], [S2], ... and the prompt should ask for
-    exactly that. The eval also accepts common model drift such as
-    [S1, chunk 11], [S1, chunk 11; S2, chunk 4], or [S1; S1, chunk 12]
-    because these still explicitly cite retrieved source ids.
-
-    Keep this intentionally scoped to square-bracket citations. Do not parse
-    bare S1 mentions in normal prose; those are too easy to confuse with other
-    identifiers.
+    Canonical output is [S1], [S2], ... . By default the eval accepts common
+    model drift such as [S1, chunk 11] because it still explicitly cites a
+    retrieved source id. Set RAG_ANSWER_EVAL_STRICT_CITATIONS=1 for CI or
+    strict contract review to accept only exact [S#] citations.
     """
+    if STRICT_CITATION_FORMAT:
+        return [int(x) for x in re.findall(r"\[S(\d+)\]", answer or "")]
+
     ids: list[int] = []
     for bracket_body in re.findall(r"\[([^\]]+)\]", answer or ""):
         for value in re.findall(r"\bS(\d+)\b", bracket_body):
@@ -367,7 +424,7 @@ def citation_ids(answer: str):
 def check_required_sections(answer: str):
     failures = []
     present = {}
-    for name, pattern in REQUIRED_SECTION_PATTERNS:
+    for name, pattern in required_section_patterns():
         ok = bool(re.search(pattern, answer or ""))
         present[name] = ok
         if not ok:
@@ -514,7 +571,7 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_r
     if len(citations) < min_citations:
         failures.append(f"too few source citations: citations={len(citations)} min={min_citations}")
     if min_citations > 0 and not unique_citations:
-        failures.append("no source citations found in [S#] / [S#, ...] format")
+        failures.append("no source citations found in accepted [S#] citation format")
 
     suspicious_source_ids = [x for x in unique_citations if x > 12]
     if suspicious_source_ids:
@@ -531,7 +588,7 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_r
     if path_hits:
         failures.append(f"full local path leaked into answer: {path_hits[:3]}")
 
-    metadata_hits = collect_regex_hits(answer, CLASSIFICATION_METADATA_LEAK_PATTERNS)
+    metadata_hits = collect_regex_hits(answer, classification_metadata_leak_patterns())
     if metadata_hits:
         failures.append(f"classification metadata leaked into answer: {metadata_hits[:5]}")
 

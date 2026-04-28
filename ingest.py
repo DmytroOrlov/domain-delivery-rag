@@ -12,13 +12,13 @@ from qdrant_client.http import models
 from domain_config import load_domain_config
 
 # =============================================================================
-# ADAS / Embedded Vision Delivery RAG - Ingestion Pipeline
+# Domain Delivery RAG - Ingestion Pipeline
 # =============================================================================
 #
-# This is a local v1 pipeline for safety-relevant embedded vision / ADAS-style
-# corpora. It is not a generic production RAG framework yet. Domain-specific
-# ontology and metadata schema values are loaded from the active domain config.
-# Metadata schema values and extraction prompt policy are loaded from the active domain config.
+# Local v1 ingestion pipeline for a domain-configured RAG collection.
+# Domain ontology, metadata schema values, logical metadata fields, document
+# aggregation policy, and extraction prompt policy are loaded from the active
+# domain config.
 # =============================================================================
 #
 # Flow:
@@ -177,17 +177,258 @@ def schema_list(field: str, default_values) -> list[str]:
     return result
 
 
-CHUNK_ROLE_VALUES = schema_values("chunk_role", DEFAULT_CHUNK_ROLE_VALUES)
-CONTENT_FACET_VALUES = schema_values("content_facets", DEFAULT_CONTENT_FACET_VALUES)
-SYSTEM_LAYER_VALUES = schema_values("system_layers", DEFAULT_SYSTEM_LAYER_VALUES)
-WORKFLOW_STAGE_VALUES = schema_values("workflow_stages", DEFAULT_WORKFLOW_STAGE_VALUES)
-SAFETY_RELEVANCE_VALUES = schema_values("safety_relevance", DEFAULT_SAFETY_RELEVANCE_VALUES)
-DELIVERY_VALUE_VALUES = schema_values("delivery_value", DEFAULT_DELIVERY_VALUE_VALUES)
-CORPUS_DECISION_VALUES = schema_values("corpus_decision", DEFAULT_CORPUS_DECISION_VALUES)
+DEFAULT_METADATA_FIELD_MAP = {
+    "role": "chunk_role",
+    "facets": "content_facets",
+    "layers": "system_layers",
+    "stages": "workflow_stages",
+    "criticality": "safety_relevance",
+    "delivery_value": "delivery_value",
+    "decision": "corpus_decision",
+    "document_primary_role": "document_primary_role",
+    "document_roles": "document_roles",
+    "document_facets": "document_content_facets",
+    "document_layers": "document_system_layers",
+    "document_stages": "document_workflow_stages",
+    "document_criticality": "document_safety_relevance",
+    "document_delivery_value": "document_delivery_value",
+    "document_decision": "document_corpus_decision",
+    "document_confidence": "document_confidence",
+    "document_signal_chunks": "document_signal_chunks",
+}
+
+
+def metadata_field(logical_name: str, default: str | None = None) -> str:
+    field_map = dict(DEFAULT_METADATA_FIELD_MAP)
+    field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
+    fallback = default if default is not None else logical_name
+    value = field_map.get(logical_name, fallback)
+    return str(value or fallback)
+
+LOGICAL_METADATA_ORDER = (
+    "role",
+    "facets",
+    "layers",
+    "stages",
+    "criticality",
+    "delivery_value",
+    "decision",
+)
+
+DEFAULT_METADATA_FIELDS = {
+    "role": {
+        "payload": "chunk_role",
+        "prompt_label": "chunk_role",
+        "schema_key": "chunk_role",
+        "kind": "enum",
+        "default": "unknown",
+    },
+    "facets": {
+        "payload": "content_facets",
+        "prompt_label": "content_facets",
+        "schema_key": "content_facets",
+        "kind": "list_enum",
+        "default": ["unknown"],
+    },
+    "layers": {
+        "payload": "system_layers",
+        "prompt_label": "system_layers",
+        "schema_key": "system_layers",
+        "kind": "list_enum",
+        "default": ["unknown"],
+    },
+    "stages": {
+        "payload": "workflow_stages",
+        "prompt_label": "workflow_stages",
+        "schema_key": "workflow_stages",
+        "kind": "list_enum",
+        "default": ["unknown"],
+    },
+    "criticality": {
+        "payload": "safety_relevance",
+        "prompt_label": "safety_relevance",
+        "schema_key": "safety_relevance",
+        "kind": "enum",
+        "default": "unknown",
+    },
+    "delivery_value": {
+        "payload": "delivery_value",
+        "prompt_label": "delivery_value",
+        "schema_key": "delivery_value",
+        "kind": "enum",
+        "default": "low",
+    },
+    "decision": {
+        "payload": "corpus_decision",
+        "prompt_label": "corpus_decision",
+        "schema_key": "corpus_decision",
+        "kind": "enum",
+        "default": "secondary",
+    },
+}
+
+
+def metadata_fields_config() -> dict:
+    configured = getattr(DOMAIN, "metadata_fields", {}) or {}
+    merged = {}
+    for logical_name, default_cfg in DEFAULT_METADATA_FIELDS.items():
+        configured_cfg = configured.get(logical_name) if isinstance(configured.get(logical_name), dict) else {}
+        cfg = dict(default_cfg)
+        cfg.update(configured_cfg)
+
+        # Backward compatible fallback: metadata_field_map can still override payload names.
+        cfg["payload"] = str(cfg.get("payload") or metadata_field(logical_name, default_cfg["payload"]))
+        cfg["prompt_label"] = str(cfg.get("prompt_label") or cfg["payload"] or logical_name)
+
+        # Important: if a domain pack supplies values_ref but omits schema_key,
+        # values_ref must win over the ADAS/default schema_key. Otherwise a new
+        # domain can silently validate against the wrong enum.
+        if configured_cfg.get("schema_key"):
+            schema_key = configured_cfg["schema_key"]
+        elif configured_cfg.get("values_ref"):
+            schema_key = str(configured_cfg["values_ref"]).split(".")[-1]
+        else:
+            schema_key = cfg.get("schema_key") or cfg.get("values_ref", "").split(".")[-1] or cfg["prompt_label"]
+        cfg["schema_key"] = str(schema_key)
+
+        cfg["kind"] = str(cfg.get("kind") or default_cfg["kind"])
+        merged[logical_name] = cfg
+    return merged
+
+
+def metadata_field_config(logical_name: str) -> dict:
+    return metadata_fields_config()[logical_name]
+
+
+def metadata_prompt_label(logical_name: str) -> str:
+    return str(metadata_field_config(logical_name).get("prompt_label") or metadata_field(logical_name))
+
+
+def metadata_payload_field(logical_name: str) -> str:
+    return str(metadata_field_config(logical_name).get("payload") or metadata_field(logical_name))
+
+
+def metadata_schema_key(logical_name: str) -> str:
+    return str(metadata_field_config(logical_name).get("schema_key") or metadata_prompt_label(logical_name))
+
+
+def metadata_kind(logical_name: str) -> str:
+    return str(metadata_field_config(logical_name).get("kind") or "enum")
+
+
+def metadata_allowed_values(logical_name: str) -> set[str]:
+    schema_key = metadata_schema_key(logical_name)
+    default_by_logical = {
+        "role": DEFAULT_CHUNK_ROLE_VALUES,
+        "facets": DEFAULT_CONTENT_FACET_VALUES,
+        "layers": DEFAULT_SYSTEM_LAYER_VALUES,
+        "stages": DEFAULT_WORKFLOW_STAGE_VALUES,
+        "criticality": DEFAULT_SAFETY_RELEVANCE_VALUES,
+        "delivery_value": DEFAULT_DELIVERY_VALUE_VALUES,
+        "decision": DEFAULT_CORPUS_DECISION_VALUES,
+    }
+    return schema_values(schema_key, default_by_logical[logical_name])
+
+
+def metadata_raw_value(raw: dict, logical_name: str):
+    cfg = metadata_field_config(logical_name)
+    candidate_keys = [
+        cfg.get("prompt_label"),
+        cfg.get("payload"),
+        metadata_field(logical_name),
+        logical_name,
+    ]
+    # Backward compatible aliases for old ADAS payloads.
+    candidate_keys.extend([
+        DEFAULT_METADATA_FIELDS[logical_name]["prompt_label"],
+        DEFAULT_METADATA_FIELDS[logical_name]["payload"],
+    ])
+    for key in candidate_keys:
+        if key and key in raw:
+            return raw.get(key)
+    return None
+
+
+ROLE_FIELD = metadata_field("role", "chunk_role")
+FACETS_FIELD = metadata_field("facets", "content_facets")
+LAYERS_FIELD = metadata_field("layers", "system_layers")
+STAGES_FIELD = metadata_field("stages", "workflow_stages")
+CRITICALITY_FIELD = metadata_field("criticality", "safety_relevance")
+DELIVERY_FIELD = metadata_field("delivery_value", "delivery_value")
+DECISION_FIELD = metadata_field("decision", "corpus_decision")
+
+DOC_PRIMARY_ROLE_FIELD = metadata_field("document_primary_role", "document_primary_role")
+DOC_ROLES_FIELD = metadata_field("document_roles", "document_roles")
+DOC_FACETS_FIELD = metadata_field("document_facets", "document_content_facets")
+DOC_LAYERS_FIELD = metadata_field("document_layers", "document_system_layers")
+DOC_STAGES_FIELD = metadata_field("document_stages", "document_workflow_stages")
+DOC_CRITICALITY_FIELD = metadata_field("document_criticality", "document_safety_relevance")
+DOC_DELIVERY_FIELD = metadata_field("document_delivery_value", "document_delivery_value")
+DOC_DECISION_FIELD = metadata_field("document_decision", "document_corpus_decision")
+DOC_CONFIDENCE_FIELD = metadata_field("document_confidence", "document_confidence")
+DOC_SIGNAL_CHUNKS_FIELD = metadata_field("document_signal_chunks", "document_signal_chunks")
+
+
+def document_aggregation_config() -> dict:
+    return dict(getattr(DOMAIN, "document_aggregation", {}) or {})
+
+
+def aggregation_rank_map(name: str, default: dict[str, int]) -> dict[str, int]:
+    raw = document_aggregation_config().get(name, default)
+    if not isinstance(raw, dict):
+        return dict(default)
+    out = {}
+    for key, value in raw.items():
+        try:
+            out[str(key)] = int(value)
+        except Exception:
+            continue
+    return out or dict(default)
+
+
+def aggregation_list(path: tuple[str, ...], default: list[str]) -> list[str]:
+    cfg = document_aggregation_config()
+    value = cfg
+    for part in path:
+        if not isinstance(value, dict):
+            return list(default)
+        value = value.get(part)
+    if not isinstance(value, list):
+        return list(default)
+    return [str(x) for x in value]
+
+
+def unique_index_fields(fields: list[tuple[str, object]]) -> list[tuple[str, object]]:
+    seen = set()
+    out = []
+    for field, schema in fields:
+        if field and field not in seen:
+            seen.add(field)
+            out.append((field, schema))
+    return out
+
+
+CHUNK_ROLE_VALUES = metadata_allowed_values("role")
+CONTENT_FACET_VALUES = metadata_allowed_values("facets")
+SYSTEM_LAYER_VALUES = metadata_allowed_values("layers")
+WORKFLOW_STAGE_VALUES = metadata_allowed_values("stages")
+SAFETY_RELEVANCE_VALUES = metadata_allowed_values("criticality")
+DELIVERY_VALUE_VALUES = metadata_allowed_values("delivery_value")
+CORPUS_DECISION_VALUES = metadata_allowed_values("decision")
 BOOLEAN_FLAG_FIELDS = tuple(schema_list("boolean_flags", DEFAULT_BOOLEAN_FLAG_FIELDS))
 
-SAFETY_RANK = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
-DELIVERY_RANK = {"low": 0, "medium": 1, "high": 2}
+METADATA_ALLOWED_VALUES = {
+    "role": CHUNK_ROLE_VALUES,
+    "facets": CONTENT_FACET_VALUES,
+    "layers": SYSTEM_LAYER_VALUES,
+    "stages": WORKFLOW_STAGE_VALUES,
+    "criticality": SAFETY_RELEVANCE_VALUES,
+    "delivery_value": DELIVERY_VALUE_VALUES,
+    "decision": CORPUS_DECISION_VALUES,
+}
+
+SAFETY_RANK = aggregation_rank_map("criticality_rank", {"unknown": 0, "low": 1, "medium": 2, "high": 3})
+DELIVERY_RANK = aggregation_rank_map("delivery_rank", {"low": 0, "medium": 1, "high": 2})
 
 
 STATS = {
@@ -626,15 +867,17 @@ def validate_chunk_metadata(raw):
     if not isinstance(raw, dict):
         raise MetadataValidationError("metadata must be a JSON object")
 
-    metadata = {
-        "chunk_role": require_enum(raw, "chunk_role", CHUNK_ROLE_VALUES),
-        "content_facets": require_list_enum(raw, "content_facets", CONTENT_FACET_VALUES),
-        "system_layers": require_list_enum(raw, "system_layers", SYSTEM_LAYER_VALUES),
-        "workflow_stages": require_list_enum(raw, "workflow_stages", WORKFLOW_STAGE_VALUES),
-        "safety_relevance": require_enum(raw, "safety_relevance", SAFETY_RELEVANCE_VALUES),
-        "delivery_value": require_enum(raw, "delivery_value", DELIVERY_VALUE_VALUES),
-        "corpus_decision": require_enum(raw, "corpus_decision", CORPUS_DECISION_VALUES),
-    }
+    metadata = {}
+    for logical_name in LOGICAL_METADATA_ORDER:
+        payload_field = metadata_payload_field(logical_name)
+        prompt_label = metadata_prompt_label(logical_name)
+        allowed = METADATA_ALLOWED_VALUES[logical_name]
+        value = metadata_raw_value(raw, logical_name)
+        temp_raw = {prompt_label: value}
+        if metadata_kind(logical_name) == "list_enum":
+            metadata[payload_field] = require_list_enum(temp_raw, prompt_label, allowed)
+        else:
+            metadata[payload_field] = require_enum(temp_raw, prompt_label, allowed)
 
     for flag in BOOLEAN_FLAG_FIELDS:
         metadata[flag] = require_bool(raw, flag)
@@ -648,30 +891,25 @@ def compact_item_to_metadata(item):
     if not isinstance(item, list):
         raise MetadataValidationError(f"compact item must be list, got {type(item).__name__}")
 
-    expected_len = 10 + len(BOOLEAN_FLAG_FIELDS)
+    logical_count = len(LOGICAL_METADATA_ORDER)
+    expected_len = 1 + logical_count + len(BOOLEAN_FLAG_FIELDS) + 2
     if len(item) != expected_len:
         raise MetadataValidationError(
             f"compact item must have {expected_len} fields, got {len(item)}: {item!r}"
         )
 
     chunk_index = normalize_chunk_index(item[0])
-    flag_start = 8
+    raw_metadata = {}
+    for offset, logical_name in enumerate(LOGICAL_METADATA_ORDER, start=1):
+        raw_metadata[metadata_prompt_label(logical_name)] = item[offset]
+
+    flag_start = 1 + logical_count
     flag_end = flag_start + len(BOOLEAN_FLAG_FIELDS)
-
-    raw_metadata = {
-        "chunk_role": item[1],
-        "content_facets": item[2],
-        "system_layers": item[3],
-        "workflow_stages": item[4],
-        "safety_relevance": item[5],
-        "delivery_value": item[6],
-        "corpus_decision": item[7],
-        "confidence": item[flag_end],
-        "reason_short": item[flag_end + 1],
-    }
-
     for offset, flag in enumerate(BOOLEAN_FLAG_FIELDS):
         raw_metadata[flag] = item[flag_start + offset]
+
+    raw_metadata["confidence"] = item[flag_end]
+    raw_metadata["reason_short"] = item[flag_end + 1]
 
     return chunk_index, validate_chunk_metadata(raw_metadata)
 
@@ -768,22 +1006,84 @@ def render_metadata_system_prompt() -> str:
     return "\n".join(rules).strip() + "\n"
 
 
+def metadata_definition_for(logical_name: str) -> str:
+    config = metadata_extraction_config()
+    definitions = config["field_definitions"]
+    prompt_label = metadata_prompt_label(logical_name)
+    payload_field = metadata_payload_field(logical_name)
+    return str(
+        definitions.get(prompt_label)
+        or definitions.get(payload_field)
+        or definitions.get(logical_name)
+        or DEFAULT_METADATA_EXTRACTION["field_definitions"].get(DEFAULT_METADATA_FIELDS[logical_name]["prompt_label"])
+        or f"metadata field {prompt_label}."
+    )
+
+
+def metadata_allowed_lines() -> str:
+    lines = []
+    for logical_name in LOGICAL_METADATA_ORDER:
+        label = metadata_prompt_label(logical_name)
+        values = ", ".join(sorted(METADATA_ALLOWED_VALUES[logical_name]))
+        lines.append(f"{label}: {values}")
+    lines.append(f"boolean flags: {', '.join(BOOLEAN_FLAG_FIELDS)}")
+    return "\n".join(lines)
+
+
+def metadata_definition_lines() -> str:
+    lines = []
+    for logical_name in LOGICAL_METADATA_ORDER:
+        lines.append(f"- {metadata_prompt_label(logical_name)}: {metadata_definition_for(logical_name)}")
+    definitions = metadata_extraction_config()["field_definitions"]
+    flag_definition = definitions.get("boolean_flags") or DEFAULT_METADATA_EXTRACTION["field_definitions"]["boolean_flags"]
+    lines.append(f"- boolean flags: {flag_definition}")
+    return "\n".join(lines)
+
+
+def compact_row_field_names() -> list[str]:
+    return [
+        "chunk_index",
+        *[metadata_prompt_label(name) for name in LOGICAL_METADATA_ORDER],
+        *BOOLEAN_FLAG_FIELDS,
+        "confidence",
+        "reason_short",
+    ]
+
+
+def compact_example_value(logical_name: str):
+    allowed = sorted(METADATA_ALLOWED_VALUES[logical_name])
+    cfg_default = metadata_field_config(logical_name).get("default")
+    if metadata_kind(logical_name) == "list_enum":
+        if isinstance(cfg_default, list) and cfg_default:
+            return cfg_default
+        for preferred in ("validation", "perception", "verification", "implementation", "unknown"):
+            if preferred in allowed:
+                return [preferred]
+        return [allowed[0]]
+    if isinstance(cfg_default, str) and cfg_default in allowed:
+        return cfg_default
+    for preferred in ("test", "high", "primary", "unknown", "secondary", "low"):
+        if preferred in allowed:
+            return preferred
+    return allowed[0]
+
+
+def compact_example_item() -> list:
+    return [
+        0,
+        *[compact_example_value(name) for name in LOGICAL_METADATA_ORDER],
+        *([False] * len(BOOLEAN_FLAG_FIELDS)),
+        0.85,
+        "Short reason.",
+    ]
+
+
 def render_metadata_user_prompt(
         expected_indices,
-        allowed_chunk_role: str,
-        allowed_content_facets: str,
-        allowed_system_layers: str,
-        allowed_workflow_stages: str,
-        allowed_safety_relevance: str,
-        allowed_delivery_value: str,
-        allowed_corpus_decision: str,
-        boolean_flag_fields: str,
-        compact_row_fields: str,
-        compact_example_item: list,
         batch_chunks: list,
 ) -> str:
     config = metadata_extraction_config()
-    definitions = config["field_definitions"]
+    compact_row_fields = ",\n      ".join(compact_row_field_names())
 
     return f"""{config['objective']}
 
@@ -791,24 +1091,10 @@ Expected chunk_index values:
 {json.dumps(expected_indices)}
 
 Allowed values:
-chunk_role: {allowed_chunk_role}
-content_facets: {allowed_content_facets}
-system_layers: {allowed_system_layers}
-workflow_stages: {allowed_workflow_stages}
-safety_relevance: {allowed_safety_relevance}
-delivery_value: {allowed_delivery_value}
-corpus_decision: {allowed_corpus_decision}
-boolean flags: {boolean_flag_fields}
+{metadata_allowed_lines()}
 
 Definitions:
-- chunk_role: {definitions['chunk_role']}
-- content_facets: {definitions['content_facets']}
-- system_layers: {definitions['system_layers']}
-- workflow_stages: {definitions['workflow_stages']}
-- safety_relevance: {definitions['safety_relevance']}
-- delivery_value: {definitions['delivery_value']}
-- corpus_decision: {definitions['corpus_decision']}
-- boolean flags: {definitions['boolean_flags']}
+{metadata_definition_lines()}
 
 {config['return_instruction']}
 
@@ -816,13 +1102,13 @@ Output schema:
 {{
   "items": [
     [
-{compact_row_fields}
+      {compact_row_fields}
     ]
   ]
 }}
 
 Example item:
-{json.dumps(compact_example_item, ensure_ascii=False)}
+{json.dumps(compact_example_item(), ensure_ascii=False)}
 
 Chunks:
 {json.dumps(batch_chunks, ensure_ascii=False, indent=2)}
@@ -865,41 +1151,6 @@ def make_balanced_batches(
 def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
     STATS["metadata_actual_requests"] += 1
 
-    allowed_chunk_role = ", ".join(sorted(CHUNK_ROLE_VALUES))
-    allowed_content_facets = ", ".join(sorted(CONTENT_FACET_VALUES))
-    allowed_system_layers = ", ".join(sorted(SYSTEM_LAYER_VALUES))
-    allowed_workflow_stages = ", ".join(sorted(WORKFLOW_STAGE_VALUES))
-    allowed_safety_relevance = ", ".join(sorted(SAFETY_RELEVANCE_VALUES))
-    allowed_delivery_value = ", ".join(sorted(DELIVERY_VALUE_VALUES))
-    allowed_corpus_decision = ", ".join(sorted(CORPUS_DECISION_VALUES))
-    boolean_flag_fields = ", ".join(BOOLEAN_FLAG_FIELDS)
-    compact_row_fields = ",\n      ".join([
-        "chunk_index",
-        "chunk_role",
-        "content_facets",
-        "system_layers",
-        "workflow_stages",
-        "safety_relevance",
-        "delivery_value",
-        "corpus_decision",
-        *BOOLEAN_FLAG_FIELDS,
-        "confidence",
-        "reason_short",
-    ])
-    compact_example_item = [
-        0,
-        "test",
-        ["validation"],
-        ["perception"],
-        ["verification"],
-        "high",
-        "high",
-        "primary",
-        *([False] * len(BOOLEAN_FLAG_FIELDS)),
-        0.85,
-        "Short reason.",
-    ]
-
     start_chunk_index = batch_chunks[0]["chunk_index"] if batch_chunks else -1
     expected_indices = [x["chunk_index"] for x in batch_chunks]
     expected_set = set(expected_indices)
@@ -907,16 +1158,6 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
     system_prompt = render_metadata_system_prompt()
     user_prompt = render_metadata_user_prompt(
         expected_indices=expected_indices,
-        allowed_chunk_role=allowed_chunk_role,
-        allowed_content_facets=allowed_content_facets,
-        allowed_system_layers=allowed_system_layers,
-        allowed_workflow_stages=allowed_workflow_stages,
-        allowed_safety_relevance=allowed_safety_relevance,
-        allowed_delivery_value=allowed_delivery_value,
-        allowed_corpus_decision=allowed_corpus_decision,
-        boolean_flag_fields=boolean_flag_fields,
-        compact_row_fields=compact_row_fields,
-        compact_example_item=compact_example_item,
         batch_chunks=batch_chunks,
     )
 
@@ -1062,27 +1303,26 @@ def extract_chunk_metadata_batch_with_retry(batch_chunks: list, file_name: str):
 # Document-level metadata aggregation
 # =============================================================================
 
+def _score_weight(mapping: dict, value, default: float = 0.0) -> float:
+    try:
+        return float(mapping.get(str(value), default))
+    except Exception:
+        return default
+
+
 def score_for_metadata(meta: dict) -> float:
-    score = 1.0
-    score += meta.get("confidence", 0.0)
+    weights = document_aggregation_config().get("score_weights") or {}
+    score = float(weights.get("base", 1.0))
 
-    if meta["delivery_value"] == "high":
-        score += 1.0
-    elif meta["delivery_value"] == "medium":
-        score += 0.5
+    try:
+        score += float(meta.get("confidence", 0.0)) * float(weights.get("confidence", 1.0))
+    except Exception:
+        pass
 
-    if meta["safety_relevance"] == "high":
-        score += 1.0
-    elif meta["safety_relevance"] == "medium":
-        score += 0.5
-
-    if meta["corpus_decision"] == "primary":
-        score += 1.0
-    elif meta["corpus_decision"] == "drop":
-        score -= 1.0
-
-    if meta["chunk_role"] in {"noise", "unknown"}:
-        score -= 0.5
+    score += _score_weight(weights.get("delivery_value", {}), meta.get(DELIVERY_FIELD))
+    score += _score_weight(weights.get("criticality", {}), meta.get(CRITICALITY_FIELD))
+    score += _score_weight(weights.get("decision", {}), meta.get(DECISION_FIELD))
+    score += _score_weight(weights.get("role", {}), meta.get(ROLE_FIELD))
 
     return max(0.0, score)
 
@@ -1092,7 +1332,7 @@ def weighted_top_values(chunk_metas, field: str, limit: int = 6, ignore_values=N
     weights = defaultdict(float)
 
     for meta in chunk_metas:
-        value = meta[field]
+        value = meta.get(field)
         score = score_for_metadata(meta)
 
         if isinstance(value, list):
@@ -1115,7 +1355,7 @@ def max_enum(chunk_metas, field: str, rank_map: dict, default: str):
     best_rank = rank_map.get(default, 0)
 
     for meta in chunk_metas:
-        value = meta[field]
+        value = meta.get(field)
         r = rank_map.get(value, 0)
         if r > best_rank:
             best = value
@@ -1125,62 +1365,98 @@ def max_enum(chunk_metas, field: str, rank_map: dict, default: str):
 
 
 def aggregate_document_metadata(chunk_metas):
+    signal_cfg = (document_aggregation_config().get("signal") or {})
+    decision_cfg = (document_aggregation_config().get("decision") or {})
+    limits = document_aggregation_config().get("weighted_top_limits") or {}
+    ignore_values = set(document_aggregation_config().get("ignore_values") or ["unknown", "noise"])
+
+    primary_decisions = set(str(x) for x in decision_cfg.get("primary_values", ["primary"]))
+    drop_decisions = set(str(x) for x in decision_cfg.get("drop_values", ["drop"]))
+    default_decision = str(decision_cfg.get("default", "secondary"))
+
     if not chunk_metas:
         return {
-            "document_primary_role": "unknown",
-            "document_roles": ["unknown"],
-            "document_content_facets": ["unknown"],
-            "document_system_layers": ["unknown"],
-            "document_workflow_stages": ["unknown"],
-            "document_safety_relevance": "unknown",
-            "document_delivery_value": "low",
-            "document_corpus_decision": "secondary",
-            "document_confidence": 0.0,
-            "document_signal_chunks": [],
+            DOC_PRIMARY_ROLE_FIELD: "unknown",
+            DOC_ROLES_FIELD: ["unknown"],
+            DOC_FACETS_FIELD: ["unknown"],
+            DOC_LAYERS_FIELD: ["unknown"],
+            DOC_STAGES_FIELD: ["unknown"],
+            DOC_CRITICALITY_FIELD: "unknown",
+            DOC_DELIVERY_FIELD: "low",
+            DOC_DECISION_FIELD: default_decision,
+            DOC_CONFIDENCE_FIELD: 0.0,
+            DOC_SIGNAL_CHUNKS_FIELD: [],
         }
 
-    roles = weighted_top_values(chunk_metas, "chunk_role", limit=6, ignore_values={"unknown", "noise"})
-    facets = weighted_top_values(chunk_metas, "content_facets", limit=10, ignore_values={"unknown"})
-    layers = weighted_top_values(chunk_metas, "system_layers", limit=10, ignore_values={"unknown"})
-    stages = weighted_top_values(chunk_metas, "workflow_stages", limit=8, ignore_values={"unknown"})
+    roles = weighted_top_values(
+        chunk_metas,
+        ROLE_FIELD,
+        limit=int(limits.get("roles", 6)),
+        ignore_values=ignore_values,
+    )
+    facets = weighted_top_values(
+        chunk_metas,
+        FACETS_FIELD,
+        limit=int(limits.get("facets", 10)),
+        ignore_values={"unknown"},
+    )
+    layers = weighted_top_values(
+        chunk_metas,
+        LAYERS_FIELD,
+        limit=int(limits.get("layers", 10)),
+        ignore_values={"unknown"},
+    )
+    stages = weighted_top_values(
+        chunk_metas,
+        STAGES_FIELD,
+        limit=int(limits.get("stages", 8)),
+        ignore_values={"unknown"},
+    )
 
     document_primary_role = roles[0] if roles else "unknown"
-    document_safety_relevance = max_enum(chunk_metas, "safety_relevance", SAFETY_RANK, "unknown")
-    document_delivery_value = max_enum(chunk_metas, "delivery_value", DELIVERY_RANK, "low")
+    document_criticality = max_enum(chunk_metas, CRITICALITY_FIELD, SAFETY_RANK, "unknown")
+    document_delivery_value = max_enum(chunk_metas, DELIVERY_FIELD, DELIVERY_RANK, "low")
 
-    decisions = [m["corpus_decision"] for m in chunk_metas]
-    if "primary" in decisions:
-        document_corpus_decision = "primary"
-    elif all(d == "drop" for d in decisions):
-        document_corpus_decision = "drop"
+    decisions = [m.get(DECISION_FIELD) for m in chunk_metas]
+    if any(d in primary_decisions for d in decisions):
+        document_decision = "primary" if "primary" in primary_decisions else sorted(primary_decisions)[0]
+    elif decisions and all(d in drop_decisions for d in decisions):
+        document_decision = "drop" if "drop" in drop_decisions else sorted(drop_decisions)[0]
     else:
-        document_corpus_decision = "secondary"
+        document_decision = default_decision
 
     avg_confidence = sum(m.get("confidence", 0.0) for m in chunk_metas) / len(chunk_metas)
 
+    signal_decisions = set(str(x) for x in signal_cfg.get("decision_values", ["primary"]))
+    signal_delivery_values = set(str(x) for x in signal_cfg.get("delivery_values", ["high"]))
+    signal_criticality_values = set(str(x) for x in signal_cfg.get("criticality_values", ["high"]))
+    signal_roles = set(str(x) for x in signal_cfg.get("roles", []))
+    signal_flags = [str(x) for x in signal_cfg.get("flags", [])]
+    max_signal_chunks = int(signal_cfg.get("max_signal_chunks", 20))
+
     signal_chunks = []
     for i, meta in enumerate(chunk_metas):
+        role = meta.get(ROLE_FIELD)
         if (
-                meta["corpus_decision"] == "primary"
-                or meta["delivery_value"] == "high"
-                or meta["safety_relevance"] == "high"
-                or meta["has_interface_or_contract"]
-                or meta["has_validation_or_test_evidence"]
-                or meta["has_failure_or_degraded_mode"]
+                meta.get(DECISION_FIELD) in signal_decisions
+                or meta.get(DELIVERY_FIELD) in signal_delivery_values
+                or meta.get(CRITICALITY_FIELD) in signal_criticality_values
+                or role in signal_roles
+                or any(meta.get(flag) is True for flag in signal_flags)
         ):
             signal_chunks.append(i)
 
     return {
-        "document_primary_role": document_primary_role,
-        "document_roles": roles or ["unknown"],
-        "document_content_facets": facets or ["unknown"],
-        "document_system_layers": layers or ["unknown"],
-        "document_workflow_stages": stages or ["unknown"],
-        "document_safety_relevance": document_safety_relevance,
-        "document_delivery_value": document_delivery_value,
-        "document_corpus_decision": document_corpus_decision,
-        "document_confidence": round(avg_confidence, 3),
-        "document_signal_chunks": signal_chunks[:20],
+        DOC_PRIMARY_ROLE_FIELD: document_primary_role,
+        DOC_ROLES_FIELD: roles or ["unknown"],
+        DOC_FACETS_FIELD: facets or ["unknown"],
+        DOC_LAYERS_FIELD: layers or ["unknown"],
+        DOC_STAGES_FIELD: stages or ["unknown"],
+        DOC_CRITICALITY_FIELD: document_criticality,
+        DOC_DELIVERY_FIELD: document_delivery_value,
+        DOC_DECISION_FIELD: document_decision,
+        DOC_CONFIDENCE_FIELD: round(avg_confidence, 3),
+        DOC_SIGNAL_CHUNKS_FIELD: signal_chunks[:max_signal_chunks],
     }
 
 
@@ -1189,26 +1465,26 @@ def aggregate_document_metadata(chunk_metas):
 # =============================================================================
 
 def create_payload_indexes(client: QdrantClient):
-    index_specs = [
+    index_specs = unique_index_fields([
         ("file_path", models.PayloadSchemaType.KEYWORD),
         ("file_name", models.PayloadSchemaType.KEYWORD),
         ("chunk_index", models.PayloadSchemaType.INTEGER),
-        ("chunk_role", models.PayloadSchemaType.KEYWORD),
-        ("content_facets", models.PayloadSchemaType.KEYWORD),
-        ("system_layers", models.PayloadSchemaType.KEYWORD),
-        ("workflow_stages", models.PayloadSchemaType.KEYWORD),
-        ("safety_relevance", models.PayloadSchemaType.KEYWORD),
-        ("delivery_value", models.PayloadSchemaType.KEYWORD),
-        ("corpus_decision", models.PayloadSchemaType.KEYWORD),
-        ("document_primary_role", models.PayloadSchemaType.KEYWORD),
-        ("document_roles", models.PayloadSchemaType.KEYWORD),
-        ("document_content_facets", models.PayloadSchemaType.KEYWORD),
-        ("document_system_layers", models.PayloadSchemaType.KEYWORD),
-        ("document_workflow_stages", models.PayloadSchemaType.KEYWORD),
-        ("document_safety_relevance", models.PayloadSchemaType.KEYWORD),
-        ("document_delivery_value", models.PayloadSchemaType.KEYWORD),
-        ("document_corpus_decision", models.PayloadSchemaType.KEYWORD),
-    ]
+        (ROLE_FIELD, models.PayloadSchemaType.KEYWORD),
+        (FACETS_FIELD, models.PayloadSchemaType.KEYWORD),
+        (LAYERS_FIELD, models.PayloadSchemaType.KEYWORD),
+        (STAGES_FIELD, models.PayloadSchemaType.KEYWORD),
+        (CRITICALITY_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DELIVERY_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DECISION_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_PRIMARY_ROLE_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_ROLES_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_FACETS_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_LAYERS_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_STAGES_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_CRITICALITY_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_DELIVERY_FIELD, models.PayloadSchemaType.KEYWORD),
+        (DOC_DECISION_FIELD, models.PayloadSchemaType.KEYWORD),
+    ])
 
     log(f"Creating payload indexes: {', '.join(field for field, _ in index_specs)}")
     for field, schema in index_specs:
@@ -1222,11 +1498,11 @@ def print_document_metadata_summary(document_meta, chunk_metas):
     decision_counts = defaultdict(int)
 
     for meta in chunk_metas:
-        role_counts[meta["chunk_role"]] += 1
-        decision_counts[meta["corpus_decision"]] += 1
-        for f in meta["content_facets"]:
+        role_counts[meta.get(ROLE_FIELD)] += 1
+        decision_counts[meta.get(DECISION_FIELD)] += 1
+        for f in meta.get(FACETS_FIELD) or []:
             facet_counts[f] += 1
-        for layer in meta["system_layers"]:
+        for layer in meta.get(LAYERS_FIELD) or []:
             layer_counts[layer] += 1
 
     top_roles = sorted(role_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -1234,11 +1510,11 @@ def print_document_metadata_summary(document_meta, chunk_metas):
     top_layers = sorted(layer_counts.items(), key=lambda x: x[1], reverse=True)[:8]
 
     log(
-        f"  document: primary_role={document_meta['document_primary_role']} "
-        f"safety={document_meta['document_safety_relevance']} "
-        f"delivery={document_meta['document_delivery_value']} "
-        f"decision={document_meta['document_corpus_decision']} "
-        f"confidence={document_meta['document_confidence']}"
+        f"  document: primary_role={document_meta.get(DOC_PRIMARY_ROLE_FIELD)} "
+        f"criticality={document_meta.get(DOC_CRITICALITY_FIELD)} "
+        f"delivery={document_meta.get(DOC_DELIVERY_FIELD)} "
+        f"decision={document_meta.get(DOC_DECISION_FIELD)} "
+        f"confidence={document_meta.get(DOC_CONFIDENCE_FIELD)}"
     )
     log(f"  corpus decisions: {dict(decision_counts)}")
     log(f"  top chunk roles: {top_roles}")
@@ -1361,7 +1637,7 @@ def main():
         for i, chunk in enumerate(chunks):
             chunk_meta = chunk_metas[i]
 
-            if chunk_meta["corpus_decision"] == "drop" and not INDEX_DROPPED_CHUNKS:
+            if chunk_meta.get(DECISION_FIELD) == "drop" and not INDEX_DROPPED_CHUNKS:
                 skipped_drop += 1
                 continue
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic search for the local ADAS / Embedded Vision Delivery RAG v1.
+Diagnostic search for the local Domain Delivery RAG.
 
 This script is intentionally a thin shell around rag_core.py. It must use the
 same retrieval, neighbor expansion, and context-packing contract as rag_proxy.py
@@ -87,12 +87,12 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 12):
             f"meta={rc.fmt_score(item.get('meta_bonus'))} "
             f"file={rc.file_name(p)} "
             f"chunk={p.get('chunk_index')} "
-            f"role={p.get('chunk_role')} "
-            f"facets={rc.fmt_list(p.get('content_facets'))} "
-            f"layers={rc.fmt_list(p.get('system_layers'))} "
-            f"safety={p.get('safety_relevance')} "
-            f"delivery={p.get('delivery_value')} "
-            f"decision={p.get('corpus_decision')}"
+            f"role={rc.payload_role(p)} "
+            f"facets={rc.fmt_list(rc.payload_facets(p))} "
+            f"layers={rc.fmt_list(rc.payload_layers(p))} "
+            f"criticality={rc.payload_criticality(p)} "
+            f"delivery={rc.payload_delivery_value(p)} "
+            f"decision={rc.payload_decision(p)}"
         )
     print()
 
@@ -109,18 +109,18 @@ def print_selected_result(rank: int, item: dict[str, Any]):
     print(f"CHUNK: {p.get('chunk_index')}")
     print("-" * 100)
     print("CHUNK METADATA (diagnostic only, not answer evidence)")
-    print(f"chunk_role: {p.get('chunk_role')}")
-    print(f"content_facets: {rc.fmt_list(p.get('content_facets'))}")
-    print(f"system_layers: {rc.fmt_list(p.get('system_layers'))}")
-    print(f"workflow_stages: {rc.fmt_list(p.get('workflow_stages'))}")
-    print(f"safety_relevance: {p.get('safety_relevance')}")
-    print(f"delivery_value: {p.get('delivery_value')}")
-    print(f"corpus_decision: {p.get('corpus_decision')}")
-    print(f"has_behavioral_requirements: {p.get('has_behavioral_requirements')}")
-    print(f"has_interface_or_contract: {p.get('has_interface_or_contract')}")
-    print(f"has_validation_or_test_evidence: {p.get('has_validation_or_test_evidence')}")
-    print(f"has_failure_or_degraded_mode: {p.get('has_failure_or_degraded_mode')}")
-    print(f"has_regulatory_or_compliance: {p.get('has_regulatory_or_compliance')}")
+    print(f"role: {rc.payload_role(p)}")
+    print(f"facets: {rc.fmt_list(rc.payload_facets(p))}")
+    print(f"layers: {rc.fmt_list(rc.payload_layers(p))}")
+    print(f"stages: {rc.fmt_list(rc.payload_stages(p))}")
+    print(f"criticality: {rc.payload_criticality(p)}")
+    print(f"delivery_value: {rc.payload_delivery_value(p)}")
+    print(f"decision: {rc.payload_decision(p)}")
+    flag_fields = rc.boolean_flag_fields()
+    if flag_fields:
+        print("boolean flags:")
+        for flag in flag_fields:
+            print(f"  {flag}: {p.get(flag)}")
     print(f"confidence: {p.get('confidence')}")
     print(f"reason_short: {p.get('reason_short')}")
     print("-" * 100)
@@ -155,11 +155,11 @@ def print_source_groups(source_groups: list[dict[str, Any]]):
                 f"mode={mode} "
                 f"final={rc.fmt_score(item.get('final_score'))} "
                 f"dense_rank={fmt_rank(item.get('dense_rank'))} "
-                f"role={p.get('chunk_role')} "
-                f"facets={rc.fmt_list(p.get('content_facets'))} "
-                f"safety={p.get('safety_relevance')} "
-                f"delivery={p.get('delivery_value')} "
-                f"decision={p.get('corpus_decision')}"
+                f"role={rc.payload_role(p)} "
+                f"facets={rc.fmt_list(rc.payload_facets(p))} "
+                f"criticality={rc.payload_criticality(p)} "
+                f"delivery={rc.payload_delivery_value(p)} "
+                f"decision={rc.payload_decision(p)}"
             )
     print()
     print("Source group summary:")

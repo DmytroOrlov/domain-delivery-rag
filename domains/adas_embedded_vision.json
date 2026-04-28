@@ -433,5 +433,169 @@
       "boolean_flags": "true only when the chunk explicitly contains that type of evidence."
     },
     "return_instruction": "Return compact JSON only."
+  },
+  "metadata_field_map": {
+    "role": "chunk_role",
+    "facets": "content_facets",
+    "layers": "system_layers",
+    "stages": "workflow_stages",
+    "criticality": "safety_relevance",
+    "delivery_value": "delivery_value",
+    "decision": "corpus_decision",
+    "document_primary_role": "document_primary_role",
+    "document_roles": "document_roles",
+    "document_facets": "document_content_facets",
+    "document_layers": "document_system_layers",
+    "document_stages": "document_workflow_stages",
+    "document_criticality": "document_safety_relevance",
+    "document_delivery_value": "document_delivery_value",
+    "document_decision": "document_corpus_decision",
+    "document_confidence": "document_confidence",
+    "document_signal_chunks": "document_signal_chunks"
+  },
+  "document_aggregation": {
+    "criticality_rank": {
+      "unknown": 0,
+      "low": 1,
+      "medium": 2,
+      "high": 3
+    },
+    "delivery_rank": {
+      "low": 0,
+      "medium": 1,
+      "high": 2
+    },
+    "decision": {
+      "primary_values": [
+        "primary"
+      ],
+      "drop_values": [
+        "drop"
+      ],
+      "default": "secondary"
+    },
+    "weighted_top_limits": {
+      "roles": 6,
+      "facets": 10,
+      "layers": 10,
+      "stages": 8
+    },
+    "ignore_values": [
+      "unknown",
+      "noise"
+    ],
+    "signal": {
+      "decision_values": [
+        "primary"
+      ],
+      "delivery_values": [
+        "high"
+      ],
+      "criticality_values": [
+        "high"
+      ],
+      "roles": [
+        "requirements",
+        "architecture",
+        "interface_contract",
+        "configuration",
+        "deployment",
+        "validation",
+        "test",
+        "regulation",
+        "operations",
+        "monitoring",
+        "data_management"
+      ],
+      "flags": [
+        "has_behavioral_requirements",
+        "has_interface_or_contract",
+        "has_validation_or_test_evidence",
+        "has_failure_or_degraded_mode",
+        "has_regulatory_or_compliance"
+      ],
+      "max_signal_chunks": 20
+    },
+    "score_weights": {
+      "base": 1.0,
+      "confidence": 1.0,
+      "delivery_value": {
+        "high": 1.0,
+        "medium": 0.5,
+        "low": 0.0
+      },
+      "criticality": {
+        "high": 1.0,
+        "medium": 0.5,
+        "low": 0.0,
+        "unknown": 0.0
+      },
+      "decision": {
+        "primary": 1.0,
+        "secondary": 0.0,
+        "drop": -1.0
+      },
+      "role": {
+        "noise": -0.5,
+        "unknown": -0.5
+      }
+    }
+  },
+  "metadata_fields": {
+    "role": {
+      "payload": "chunk_role",
+      "prompt_label": "chunk_role",
+      "values_ref": "metadata_schema.chunk_role",
+      "kind": "enum",
+      "default": "unknown"
+    },
+    "facets": {
+      "payload": "content_facets",
+      "prompt_label": "content_facets",
+      "values_ref": "metadata_schema.content_facets",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "layers": {
+      "payload": "system_layers",
+      "prompt_label": "system_layers",
+      "values_ref": "metadata_schema.system_layers",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "stages": {
+      "payload": "workflow_stages",
+      "prompt_label": "workflow_stages",
+      "values_ref": "metadata_schema.workflow_stages",
+      "kind": "list_enum",
+      "default": [
+        "unknown"
+      ]
+    },
+    "criticality": {
+      "payload": "safety_relevance",
+      "prompt_label": "safety_relevance",
+      "values_ref": "metadata_schema.safety_relevance",
+      "kind": "enum",
+      "default": "unknown"
+    },
+    "delivery_value": {
+      "payload": "delivery_value",
+      "prompt_label": "delivery_value",
+      "values_ref": "metadata_schema.delivery_value",
+      "kind": "enum",
+      "default": "low"
+    },
+    "decision": {
+      "payload": "corpus_decision",
+      "prompt_label": "corpus_decision",
+      "values_ref": "metadata_schema.corpus_decision",
+      "kind": "enum",
+      "default": "secondary"
+    }
   }
 }

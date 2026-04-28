@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Metadata-prior ablation for the local ADAS / Embedded Vision Delivery RAG v1.
+Metadata-prior ablation for the local Domain Delivery RAG.
 
 Purpose
 -------
@@ -88,28 +88,6 @@ RUN_ROOT = Path(
 MINOR_RANK_SHIFT_MAX_DELTA = 0.25
 
 
-def _expand_eval_path(value: Any, fallback: str) -> Path:
-    raw = str(value) if value else fallback
-    return Path(raw).expanduser()
-
-
-# eval_retrieval owns EVAL_FILE / SOURCE_MAP_FILE, but older domain-config
-# patches may leave paths like "~/rag_v1/eval_queries.json" unexpanded there.
-# Normalize them here so this ablation script works with both pre-domain and
-# domain-config versions of eval_retrieval.py.
-ev.EVAL_FILE = _expand_eval_path(
-    os.environ.get("RAG_EVAL_FILE", getattr(rc.DOMAIN, "eval_file", getattr(ev, "EVAL_FILE", "eval_queries.json"))),
-    "eval_queries.json",
-)
-ev.SOURCE_MAP_FILE = _expand_eval_path(
-    os.environ.get(
-        "RAG_EVAL_SOURCE_MAP",
-        getattr(rc.DOMAIN, "eval_source_map", getattr(ev, "SOURCE_MAP_FILE", "eval_source_map.local.json")),
-    ),
-    "eval_source_map.local.json",
-)
-
-
 def item_ref(item: dict[str, Any]) -> str:
     p = item["payload"]
     return f"{rc.file_name(p)}:#{p.get('chunk_index')}"
@@ -164,9 +142,9 @@ def selected_distractor_penalty(selected: list[dict[str, Any]]) -> tuple[float, 
     for item in selected:
         p = item["payload"]
         ref = item_ref(item)
-        decision = p.get("corpus_decision")
-        delivery = p.get("delivery_value")
-        safety = p.get("safety_relevance")
+        decision = rc.payload_decision(p)
+        delivery = rc.payload_delivery_value(p)
+        criticality = rc.payload_criticality(p)
 
         if decision == "drop":
             penalty += 4.0
@@ -178,9 +156,9 @@ def selected_distractor_penalty(selected: list[dict[str, Any]]) -> tuple[float, 
         if delivery == "low":
             penalty += 0.3
             reasons.append(f"{ref}: low delivery value (-0.3)")
-        if safety == "low":
+        if criticality == "low":
             penalty += 0.2
-            reasons.append(f"{ref}: low safety relevance (-0.2)")
+            reasons.append(f"{ref}: low criticality (-0.2)")
 
     return penalty, reasons
 
@@ -336,8 +314,8 @@ def run_mode(case: dict[str, Any], *, use_metadata_prior: bool) -> dict[str, Any
                 "meta_bonus": item.get("meta_bonus"),
                 "final_score": item.get("final_score"),
                 "dense_rank": item.get("dense_rank"),
-                "role": item["payload"].get("chunk_role"),
-                "facets": item["payload"].get("content_facets"),
+                "role": rc.payload_role(item["payload"]),
+                "facets": rc.payload_facets(item["payload"]),
             }
             for i, item in enumerate(candidates[:12], start=1)
         ],
