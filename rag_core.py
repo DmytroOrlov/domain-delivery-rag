@@ -88,33 +88,31 @@ METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
 
-DEFAULT_METADATA_FIELD_MAP = {
-    "role": "chunk_role",
-    "facets": "content_facets",
-    "layers": "system_layers",
-    "stages": "workflow_stages",
-    "criticality": "safety_relevance",
-    "delivery_value": "delivery_value",
-    "decision": "corpus_decision",
-}
+DEFAULT_METADATA_FIELD_MAP: dict[str, str] = {}
+
+
+def metadata_fields_config() -> dict[str, Any]:
+    return dict(getattr(DOMAIN, "metadata_fields", {}) or {})
 
 
 def metadata_field(logical_name: str, default: str | None = None) -> str:
     """Return the payload field name for a logical metadata concept.
 
-    ADAS keeps the legacy payload fields such as safety_relevance and
-    system_layers. Other domain packs may map the same logical concepts to
-    different payload names without changing the retrieval engine code.
+    Chunk-level logical fields are defined by DOMAIN.metadata_fields and its
+    per-field ``payload`` value. DOMAIN.metadata_field_map is reserved for
+    document-level aliases.
     """
+    fields = metadata_fields_config()
+    field_cfg = fields.get(logical_name) if isinstance(fields.get(logical_name), dict) else {}
+    payload = field_cfg.get("payload") if isinstance(field_cfg, dict) else None
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+
     field_map = dict(DEFAULT_METADATA_FIELD_MAP)
     field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
     fallback = default if default is not None else logical_name
     value = field_map.get(logical_name, fallback)
     return str(value or fallback)
-
-
-def metadata_fields_config() -> dict[str, Any]:
-    return dict(getattr(DOMAIN, "metadata_fields", {}) or {})
 
 
 def boolean_flag_fields() -> list[str]:
@@ -197,7 +195,7 @@ def answer_config() -> dict[str, Any]:
 
 def answer_persona() -> str:
     cfg = answer_config()
-    return str(cfg.get("persona") or getattr(DOMAIN, "answer_persona", "You are a senior domain delivery assistant."))
+    return str(cfg.get("persona") or "You are a senior domain delivery assistant.")
 
 
 def answer_grounding_rules() -> list[str]:

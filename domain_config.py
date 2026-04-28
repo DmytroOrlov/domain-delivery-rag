@@ -33,7 +33,6 @@ class DomainConfig:
     eval_file: str
     eval_source_map: str
     eval_run_dir: str
-    answer_persona: str
     answer: dict[str, Any]
     retrieval_defaults: dict[str, Any]
     context_defaults: dict[str, Any]
@@ -48,11 +47,7 @@ class DomainConfig:
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "DomainConfig":
         answer = dict(data.get("answer", {}))
-        legacy_persona = data.get("answer_persona")
-        persona = str(answer.get("persona") or legacy_persona or "You are a senior domain delivery assistant.")
-
-        # Keep the legacy field for old callers, but make the structured answer
-        # contract the preferred source for prompt rendering and repair prompts.
+        persona = str(answer.get("persona") or "You are a senior domain delivery assistant.")
         answer.setdefault("persona", persona)
 
         return DomainConfig(
@@ -64,7 +59,6 @@ class DomainConfig:
             eval_file=str(data.get("eval_file", "eval_queries.json")),
             eval_source_map=str(data.get("eval_source_map", "eval_source_map.local.json")),
             eval_run_dir=str(data.get("eval_run_dir", "eval_runs")),
-            answer_persona=persona,
             answer=answer,
             retrieval_defaults=dict(data.get("retrieval_defaults", {})),
             context_defaults=dict(data.get("context_defaults", {})),
@@ -144,7 +138,7 @@ def _schema_values(config: DomainConfig, logical_name: str) -> set[str]:
 
 def _payload_field_for_logical(config: DomainConfig, logical_name: str) -> str:
     field_cfg = config.metadata_fields.get(logical_name) or {}
-    return str(field_cfg.get("payload") or config.metadata_field_map.get(logical_name) or logical_name)
+    return str(field_cfg.get("payload") or logical_name)
 
 
 def _logical_for_weight_key(config: DomainConfig, key: str) -> str | None:
@@ -195,14 +189,15 @@ def _validate_numeric_mapping(context: str, mapping: Any) -> None:
 def _validate_metadata_field_map(config: DomainConfig) -> None:
     """Validate aliases in metadata_field_map.
 
-    The map may contain the core logical fields plus document-level aliases used
-    by aggregation/debug payloads. Unknown keys are usually typos and should fail
-    early instead of silently producing an inconsistent domain pack.
+    The map contains document-level aliases used by aggregation/debug payloads.
+    Chunk-level fields are defined by metadata_fields.<logical>.payload. Unknown
+    keys are usually typos and should fail early instead of silently producing an
+    inconsistent domain pack.
     """
     if not isinstance(config.metadata_field_map, dict):
         raise ValueError("metadata_field_map must be an object")
 
-    allowed = set(REQUIRED_METADATA_LOGICAL_FIELDS) | {
+    allowed = {
         "document_primary_role",
         "document_roles",
         "document_facets",
@@ -510,7 +505,6 @@ def validate_domain_config(config: DomainConfig) -> None:
 
     metadata_schema = config.metadata_schema or {}
     metadata_fields = config.metadata_fields or {}
-    metadata_field_map = config.metadata_field_map or {}
 
     if not metadata_schema:
         raise ValueError("metadata_schema is required in domain config")
@@ -521,7 +515,7 @@ def validate_domain_config(config: DomainConfig) -> None:
         field_cfg = metadata_fields.get(logical_name)
         if not isinstance(field_cfg, dict):
             raise ValueError(f"metadata_fields.{logical_name} must be defined as an object")
-        payload = str(field_cfg.get("payload") or metadata_field_map.get(logical_name) or "")
+        payload = str(field_cfg.get("payload") or "")
         prompt_label = str(field_cfg.get("prompt_label") or payload or "")
         if not payload:
             raise ValueError(f"metadata_fields.{logical_name}: payload is required")

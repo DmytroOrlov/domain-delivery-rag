@@ -7,7 +7,6 @@
   "eval_file": "evals/generic_delivery_example/eval_queries.json",
   "eval_source_map": "evals/generic_delivery_example/eval_source_map.local.example.json",
   "eval_run_dir": "eval_runs/generic_delivery_example",
-  "answer_persona": "You are a senior domain delivery assistant.",
   "retrieval_defaults": {
     "top_k": 5,
     "pre_k": 24,
@@ -245,13 +244,6 @@
     "return_instruction": "Return JSON mapping chunk index to metadata object. Do not include markdown."
   },
   "metadata_field_map": {
-    "role": "evidence_role",
-    "facets": "evidence_facets",
-    "layers": "delivery_layers",
-    "stages": "delivery_stages",
-    "criticality": "business_impact",
-    "delivery_value": "delivery_value",
-    "decision": "evidence_decision",
     "document_primary_role": "document_primary_role",
     "document_roles": "document_roles",
     "document_facets": "document_evidence_facets",

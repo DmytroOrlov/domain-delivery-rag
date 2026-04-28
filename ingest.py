@@ -178,13 +178,6 @@ def schema_list(field: str, default_values) -> list[str]:
 
 
 DEFAULT_METADATA_FIELD_MAP = {
-    "role": "chunk_role",
-    "facets": "content_facets",
-    "layers": "system_layers",
-    "stages": "workflow_stages",
-    "criticality": "safety_relevance",
-    "delivery_value": "delivery_value",
-    "decision": "corpus_decision",
     "document_primary_role": "document_primary_role",
     "document_roles": "document_roles",
     "document_facets": "document_content_facets",
@@ -199,6 +192,18 @@ DEFAULT_METADATA_FIELD_MAP = {
 
 
 def metadata_field(logical_name: str, default: str | None = None) -> str:
+    """Return configured payload field for a logical metadata concept.
+
+    DOMAIN.metadata_fields.<logical>.payload is the source of truth for
+    chunk-level fields. DOMAIN.metadata_field_map is kept for document-level
+    aliases.
+    """
+    configured = getattr(DOMAIN, "metadata_fields", {}) or {}
+    field_cfg = configured.get(logical_name) if isinstance(configured.get(logical_name), dict) else {}
+    payload = field_cfg.get("payload") if isinstance(field_cfg, dict) else None
+    if isinstance(payload, str) and payload.strip():
+        return payload.strip()
+
     field_map = dict(DEFAULT_METADATA_FIELD_MAP)
     field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
     fallback = default if default is not None else logical_name
@@ -276,7 +281,7 @@ def metadata_fields_config() -> dict:
         cfg = dict(default_cfg)
         cfg.update(configured_cfg)
 
-        # Backward compatible fallback: metadata_field_map can still override payload names.
+        # metadata_fields.<logical>.payload is the source of truth for chunk-level fields.
         cfg["payload"] = str(cfg.get("payload") or metadata_field(logical_name, default_cfg["payload"]))
         cfg["prompt_label"] = str(cfg.get("prompt_label") or cfg["payload"] or logical_name)
 
@@ -1012,9 +1017,12 @@ def metadata_definition_for(logical_name: str) -> str:
     prompt_label = metadata_prompt_label(logical_name)
     payload_field = metadata_payload_field(logical_name)
     return str(
-        definitions.get(prompt_label)
+        # Prefer logical definitions from the domain pack. This lets configs stay
+        # domain-neutral even when ADAS-compatible prompt labels/payload names
+        # are also present as legacy defaults.
+        definitions.get(logical_name)
+        or definitions.get(prompt_label)
         or definitions.get(payload_field)
-        or definitions.get(logical_name)
         or DEFAULT_METADATA_EXTRACTION["field_definitions"].get(DEFAULT_METADATA_FIELDS[logical_name]["prompt_label"])
         or f"metadata field {prompt_label}."
     )

@@ -7,7 +7,6 @@
   "eval_file": "evals/adas_embedded_vision/eval_queries.json",
   "eval_source_map": "evals/adas_embedded_vision/eval_source_map.local.json",
   "eval_run_dir": "eval_runs",
-  "answer_persona": "You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.",
   "retrieval_defaults": {
     "top_k": 5,
     "pre_k": 24,
@@ -254,7 +253,7 @@
       0.05
     ],
     "base_weights": {
-      "corpus_decision": {
+      "decision": {
         "primary": 0.005,
         "drop": -0.04
       },
@@ -263,11 +262,11 @@
         "medium": 0.002,
         "low": -0.002
       },
-      "safety_relevance": {
+      "criticality": {
         "high": 0.004,
         "medium": 0.001
       },
-      "chunk_role": {
+      "role": {
         "noise": -0.04,
         "unknown": -0.01
       }
@@ -423,25 +422,18 @@
     ],
     "objective": "Classify each chunk independently for a Domain Delivery RAG focused on engineering delivery for safety-relevant technical systems.",
     "field_definitions": {
-      "chunk_role": "the primary role of this chunk.",
-      "content_facets": "what kind of useful content appears here. Multiple values are allowed.",
-      "system_layers": "which system layer this chunk concerns. Multiple values are allowed.",
-      "workflow_stages": "where this chunk helps in delivery lifecycle. Multiple values are allowed.",
-      "safety_relevance": "high only if this chunk directly affects safety behavior, safety assurance, compliance, validation, failure/degraded modes, or safety-critical deployment.",
+      "role": "the primary role of this chunk.",
+      "facets": "what kind of useful content appears here. Multiple values are allowed.",
+      "layers": "which system layer this chunk concerns. Multiple values are allowed.",
+      "stages": "where this chunk helps in delivery lifecycle. Multiple values are allowed.",
+      "criticality": "high only if this chunk directly affects safety behavior, safety assurance, compliance, validation, failure/degraded modes, or safety-critical deployment.",
       "delivery_value": "high only if this chunk helps implementation, verification, release, debugging, integration, or decision-making.",
-      "corpus_decision": "primary if this chunk should be indexed for v1 delivery RAG; secondary if useful but not core; drop if mostly noise.",
+      "decision": "primary if this chunk should be indexed for v1 delivery RAG; secondary if useful but not core; drop if mostly noise.",
       "boolean_flags": "true only when the chunk explicitly contains that type of evidence."
     },
     "return_instruction": "Return compact JSON only."
   },
   "metadata_field_map": {
-    "role": "chunk_role",
-    "facets": "content_facets",
-    "layers": "system_layers",
-    "stages": "workflow_stages",
-    "criticality": "safety_relevance",
-    "delivery_value": "delivery_value",
-    "decision": "corpus_decision",
     "document_primary_role": "document_primary_role",
     "document_roles": "document_roles",
     "document_facets": "document_content_facets",

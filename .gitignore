@@ -1,5 +1,5 @@
 /lexical.sqlite
-/evals/adas_embedded_vision/eval_source_map.local.json
+/evals/*/eval_source_map.local.json
 /files/
 /pdf/
 /venv/
