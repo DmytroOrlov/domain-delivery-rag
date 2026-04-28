@@ -18,7 +18,7 @@ from domain_config import load_domain_config
 # This is a local v1 pipeline for safety-relevant embedded vision / ADAS-style
 # corpora. It is not a generic production RAG framework yet. Domain-specific
 # ontology and metadata schema values are loaded from the active domain config.
-# The extraction prompt template is still explicit here and is the next planned seam.
+# Metadata schema values and extraction prompt policy are loaded from the active domain config.
 # =============================================================================
 #
 # Flow:
@@ -697,6 +697,137 @@ def item_to_metadata(item):
 # Metadata extraction batching and strict retry policy
 # =============================================================================
 
+
+DEFAULT_METADATA_EXTRACTION = {
+    "system_rules": [
+        "You are a strict metadata extractor for a technical RAG corpus.",
+        "Return JSON only.",
+        "Do not explain.",
+        "Do not include markdown.",
+        "Use only the provided chunk texts.",
+        "Use chunk_index only as an identifier, never as evidence.",
+        "Do not infer missing context from surrounding chunks.",
+        "Use exact enum values only.",
+        "Classify each chunk independently.",
+        "Do not create metadata for chunks that are not explicitly listed.",
+        "Return exactly one compact row for every expected chunk_index.",
+        "If unsure, use \"unknown\" where allowed.",
+    ],
+    "objective": (
+        "Classify each chunk independently for a Domain Delivery RAG focused on "
+        "engineering delivery for safety-relevant technical systems."
+    ),
+    "field_definitions": {
+        "chunk_role": "the primary role of this chunk.",
+        "content_facets": "what kind of useful content appears here. Multiple values are allowed.",
+        "system_layers": "which system layer this chunk concerns. Multiple values are allowed.",
+        "workflow_stages": "where this chunk helps in delivery lifecycle. Multiple values are allowed.",
+        "safety_relevance": (
+            "high only if this chunk directly affects safety behavior, safety assurance, "
+            "compliance, validation, failure/degraded modes, or safety-critical deployment."
+        ),
+        "delivery_value": (
+            "high only if this chunk helps implementation, verification, release, debugging, "
+            "integration, or decision-making."
+        ),
+        "corpus_decision": (
+            "primary if this chunk should be indexed for v1 delivery RAG; secondary if useful "
+            "but not core; drop if mostly noise."
+        ),
+        "boolean_flags": "true only when the chunk explicitly contains that type of evidence.",
+    },
+    "return_instruction": "Return compact JSON only.",
+}
+
+
+def metadata_extraction_config() -> dict:
+    config = dict(DEFAULT_METADATA_EXTRACTION)
+    domain_config = getattr(DOMAIN, "metadata_extraction", {}) or {}
+
+    if isinstance(domain_config.get("system_rules"), list) and domain_config["system_rules"]:
+        config["system_rules"] = [str(x) for x in domain_config["system_rules"] if str(x).strip()]
+
+    if isinstance(domain_config.get("objective"), str) and domain_config["objective"].strip():
+        config["objective"] = domain_config["objective"].strip()
+
+    field_definitions = dict(DEFAULT_METADATA_EXTRACTION["field_definitions"])
+    if isinstance(domain_config.get("field_definitions"), dict):
+        for key, value in domain_config["field_definitions"].items():
+            if isinstance(value, str) and value.strip():
+                field_definitions[str(key)] = value.strip()
+    config["field_definitions"] = field_definitions
+
+    if isinstance(domain_config.get("return_instruction"), str) and domain_config["return_instruction"].strip():
+        config["return_instruction"] = domain_config["return_instruction"].strip()
+
+    return config
+
+
+def render_metadata_system_prompt() -> str:
+    rules = metadata_extraction_config()["system_rules"]
+    return "\n".join(rules).strip() + "\n"
+
+
+def render_metadata_user_prompt(
+        expected_indices,
+        allowed_chunk_role: str,
+        allowed_content_facets: str,
+        allowed_system_layers: str,
+        allowed_workflow_stages: str,
+        allowed_safety_relevance: str,
+        allowed_delivery_value: str,
+        allowed_corpus_decision: str,
+        boolean_flag_fields: str,
+        compact_row_fields: str,
+        compact_example_item: list,
+        batch_chunks: list,
+) -> str:
+    config = metadata_extraction_config()
+    definitions = config["field_definitions"]
+
+    return f"""{config['objective']}
+
+Expected chunk_index values:
+{json.dumps(expected_indices)}
+
+Allowed values:
+chunk_role: {allowed_chunk_role}
+content_facets: {allowed_content_facets}
+system_layers: {allowed_system_layers}
+workflow_stages: {allowed_workflow_stages}
+safety_relevance: {allowed_safety_relevance}
+delivery_value: {allowed_delivery_value}
+corpus_decision: {allowed_corpus_decision}
+boolean flags: {boolean_flag_fields}
+
+Definitions:
+- chunk_role: {definitions['chunk_role']}
+- content_facets: {definitions['content_facets']}
+- system_layers: {definitions['system_layers']}
+- workflow_stages: {definitions['workflow_stages']}
+- safety_relevance: {definitions['safety_relevance']}
+- delivery_value: {definitions['delivery_value']}
+- corpus_decision: {definitions['corpus_decision']}
+- boolean flags: {definitions['boolean_flags']}
+
+{config['return_instruction']}
+
+Output schema:
+{{
+  "items": [
+    [
+{compact_row_fields}
+    ]
+  ]
+}}
+
+Example item:
+{json.dumps(compact_example_item, ensure_ascii=False)}
+
+Chunks:
+{json.dumps(batch_chunks, ensure_ascii=False, indent=2)}
+"""
+
 def make_balanced_batches(
         chunks,
         target_batch_size: int,
@@ -773,63 +904,21 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
     expected_indices = [x["chunk_index"] for x in batch_chunks]
     expected_set = set(expected_indices)
 
-    system_prompt = """You are a strict metadata extractor for a technical RAG corpus.
-
-Return JSON only.
-Do not explain.
-Do not include markdown.
-Use only the provided chunk texts.
-Use chunk_index only as an identifier, never as evidence.
-Do not infer missing context from surrounding chunks.
-Use exact enum values only.
-Classify each chunk independently.
-Do not create metadata for chunks that are not explicitly listed.
-Return exactly one compact row for every expected chunk_index.
-If unsure, use "unknown" where allowed.
-"""
-
-    user_prompt = f"""Classify each chunk independently for a Domain Delivery RAG focused on engineering delivery for safety-relevant technical systems.
-
-Expected chunk_index values:
-{json.dumps(expected_indices)}
-
-Allowed values:
-chunk_role: {allowed_chunk_role}
-content_facets: {allowed_content_facets}
-system_layers: {allowed_system_layers}
-workflow_stages: {allowed_workflow_stages}
-safety_relevance: {allowed_safety_relevance}
-delivery_value: {allowed_delivery_value}
-corpus_decision: {allowed_corpus_decision}
-boolean flags: {boolean_flag_fields}
-
-Definitions:
-- chunk_role: the primary role of this chunk.
-- content_facets: what kind of useful content appears here. Multiple values are allowed.
-- system_layers: which system layer this chunk concerns. Multiple values are allowed.
-- workflow_stages: where this chunk helps in delivery lifecycle. Multiple values are allowed.
-- safety_relevance: high only if this chunk directly affects safety behavior, safety assurance, compliance, validation, failure/degraded modes, or safety-critical deployment.
-- delivery_value: high only if this chunk helps implementation, verification, release, debugging, integration, or decision-making.
-- corpus_decision: primary if this chunk should be indexed for v1 delivery RAG; secondary if useful but not core; drop if mostly noise.
-- boolean flags: true only when the chunk explicitly contains that type of evidence.
-
-Return compact JSON only.
-
-Output schema:
-{{
-  "items": [
-    [
-{compact_row_fields}
-    ]
-  ]
-}}
-
-Example item:
-{json.dumps(compact_example_item, ensure_ascii=False)}
-
-Chunks:
-{json.dumps(batch_chunks, ensure_ascii=False, indent=2)}
-"""
+    system_prompt = render_metadata_system_prompt()
+    user_prompt = render_metadata_user_prompt(
+        expected_indices=expected_indices,
+        allowed_chunk_role=allowed_chunk_role,
+        allowed_content_facets=allowed_content_facets,
+        allowed_system_layers=allowed_system_layers,
+        allowed_workflow_stages=allowed_workflow_stages,
+        allowed_safety_relevance=allowed_safety_relevance,
+        allowed_delivery_value=allowed_delivery_value,
+        allowed_corpus_decision=allowed_corpus_decision,
+        boolean_flag_fields=boolean_flag_fields,
+        compact_row_fields=compact_row_fields,
+        compact_example_item=compact_example_item,
+        batch_chunks=batch_chunks,
+    )
 
     payload = {
         "messages": [

@@ -7,7 +7,7 @@ Default domain:
 
 The loader intentionally starts small. It creates a domain boundary for runtime
 paths/defaults/persona, query profiling rules, and metadata-prior
-weights, answer contract, and ingestion metadata schema.
+weights, answer contract, ingestion metadata schema, and metadata extraction prompt.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ class DomainConfig:
     query_profiles: list[dict[str, Any]]
     rerank: dict[str, Any]
     metadata_schema: dict[str, Any]
+    metadata_extraction: dict[str, Any]
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "DomainConfig":
@@ -66,6 +67,7 @@ class DomainConfig:
             query_profiles=list(data.get("query_profiles", [])),
             rerank=dict(data.get("rerank", {})),
             metadata_schema=dict(data.get("metadata_schema", {})),
+            metadata_extraction=dict(data.get("metadata_extraction", {})),
         )
 
 

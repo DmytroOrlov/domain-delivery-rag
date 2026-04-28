@@ -405,5 +405,33 @@
       "has_failure_or_degraded_mode",
       "has_regulatory_or_compliance"
     ]
+  },
+  "metadata_extraction": {
+    "system_rules": [
+      "You are a strict metadata extractor for a technical RAG corpus.",
+      "Return JSON only.",
+      "Do not explain.",
+      "Do not include markdown.",
+      "Use only the provided chunk texts.",
+      "Use chunk_index only as an identifier, never as evidence.",
+      "Do not infer missing context from surrounding chunks.",
+      "Use exact enum values only.",
+      "Classify each chunk independently.",
+      "Do not create metadata for chunks that are not explicitly listed.",
+      "Return exactly one compact row for every expected chunk_index.",
+      "If unsure, use \"unknown\" where allowed."
+    ],
+    "objective": "Classify each chunk independently for a Domain Delivery RAG focused on engineering delivery for safety-relevant technical systems.",
+    "field_definitions": {
+      "chunk_role": "the primary role of this chunk.",
+      "content_facets": "what kind of useful content appears here. Multiple values are allowed.",
+      "system_layers": "which system layer this chunk concerns. Multiple values are allowed.",
+      "workflow_stages": "where this chunk helps in delivery lifecycle. Multiple values are allowed.",
+      "safety_relevance": "high only if this chunk directly affects safety behavior, safety assurance, compliance, validation, failure/degraded modes, or safety-critical deployment.",
+      "delivery_value": "high only if this chunk helps implementation, verification, release, debugging, integration, or decision-making.",
+      "corpus_decision": "primary if this chunk should be indexed for v1 delivery RAG; secondary if useful but not core; drop if mostly noise.",
+      "boolean_flags": "true only when the chunk explicitly contains that type of evidence."
+    },
+    "return_instruction": "Return compact JSON only."
   }
 }
