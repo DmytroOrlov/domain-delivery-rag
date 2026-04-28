@@ -18,5 +18,68 @@
     "selected_max_chars": 2200,
     "neighbor_snippet_chars": 700,
     "context_max_chars": 18000
-  }
+  },
+  "query_profiles": [
+    {
+      "name": "warning_behavior",
+      "triggers": ["warning", "alert", "alarm", "hmi", "driver", "stage", "stages", "yellow", "red"],
+      "add_facets": ["system_behavior", "interface", "constraints"],
+      "add_layers": ["hmi", "decision_logic", "vehicle_integration"],
+      "add_flags": ["has_behavioral_requirements"]
+    },
+    {
+      "name": "perception_detection",
+      "triggers": ["blind spot", "pedestrian", "cyclist", "vru", "detection", "perception", "person"],
+      "add_facets": ["system_behavior", "performance", "constraints"],
+      "add_layers": ["perception", "sensor", "decision_logic"]
+    },
+    {
+      "name": "validation_and_test_evidence",
+      "triggers": ["false positive", "false positives", "false negative", "false negatives", "fp", "fn", "validation", "verification", "test", "tests", "scenario", "scenarios"],
+      "add_roles": ["validation", "test"],
+      "add_facets": ["validation", "test_scenarios", "performance", "failure_modes"],
+      "add_stages": ["verification"],
+      "add_flags": ["has_validation_or_test_evidence"]
+    },
+    {
+      "name": "failure_or_degraded_mode",
+      "triggers": ["degraded", "fallback", "shutdown", "failure", "contamination", "blocked", "lighting", "unavailable", "fault"],
+      "add_facets": ["failure_modes", "system_behavior", "constraints"],
+      "add_layers": ["sensor", "decision_logic", "hmi"],
+      "add_flags": ["has_failure_or_degraded_mode"]
+    },
+    {
+      "name": "interface_or_contract",
+      "triggers": ["interface", "can", "gpio", "api", "contract", "integration", "signal"],
+      "add_roles": ["interface_contract"],
+      "add_facets": ["interface", "configuration", "implementation"],
+      "add_layers": ["vehicle_integration", "embedded_runtime", "hmi"],
+      "add_flags": ["has_interface_or_contract"]
+    },
+    {
+      "name": "deployment_runtime",
+      "triggers": ["deploy", "deployment", "runtime", "embedded", "edge", "latency", "performance", "quantized", "int8"],
+      "add_roles": ["deployment"],
+      "add_facets": ["deployment", "performance", "implementation", "constraints"],
+      "add_layers": ["embedded_runtime", "perception"],
+      "add_stages": ["implementation", "release"]
+    },
+    {
+      "name": "regulation_compliance",
+      "triggers": ["regulation", "regulatory", "compliance", "standard", "standards", "certification", "approval", "ece", "gsr", "iso"],
+      "add_roles": ["regulation"],
+      "add_facets": ["regulatory", "constraints"],
+      "add_layers": ["compliance"],
+      "add_stages": ["verification", "release"],
+      "add_flags": ["has_regulatory_or_compliance"]
+    },
+    {
+      "name": "data_management",
+      "triggers": ["data", "annotation", "training", "dataset", "augmentation", "label", "labels"],
+      "add_roles": ["data_management"],
+      "add_facets": ["data", "implementation", "examples"],
+      "add_layers": ["data_pipeline"],
+      "add_stages": ["implementation", "verification"]
+    }
+  ]
 }

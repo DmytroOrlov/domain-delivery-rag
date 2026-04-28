@@ -5,10 +5,9 @@ Shared dense-retrieval core for the local ADAS / Embedded Vision Delivery RAG v1
 This module is the single source of truth for the v1 runtime retrieval contract.
 
 Scope note:
-  The current ontology and query-profile terms are intentionally domain-specific
-  to safety-relevant embedded vision / ADAS corpora. This is not a generic
-  multi-domain RAG framework yet; if the project expands, these terms should move
-  into a domain configuration file.
+  Query-profile rules are now loaded from the active domain config. Ingest
+  ontology and metadata-prior weights are still domain-specific in code and are
+  expected to move into the domain pack in later refactors.
 
 Runtime contract:
 
@@ -179,11 +178,8 @@ def tokenize_query(query: str) -> list[str]:
     return [t for t in tokens if t not in stop]
 
 
-def query_profile(query: str) -> dict[str, set[str]]:
-    q = query.lower()
-    tokens = set(tokenize_query(query))
-
-    profile: dict[str, set[str]] = {
+def _empty_query_profile() -> dict[str, set[str]]:
+    return {
         "roles": set(),
         "facets": set(),
         "layers": set(),
@@ -191,62 +187,48 @@ def query_profile(query: str) -> dict[str, set[str]]:
         "flags": set(),
     }
 
-    def has_any(words: list[str]) -> bool:
-        return any(w in q for w in words) or any(w in tokens for w in words)
 
-    if has_any(["warning", "alert", "alarm", "hmi", "driver", "stage", "stages", "yellow", "red"]):
-        profile["facets"].update({"system_behavior", "interface", "constraints"})
-        profile["layers"].update({"hmi", "decision_logic", "vehicle_integration"})
-        profile["flags"].add("has_behavioral_requirements")
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    return [str(value)]
 
-    if has_any(["blind spot", "pedestrian", "cyclist", "vru", "detection", "perception", "person"]):
-        profile["facets"].update({"system_behavior", "performance", "constraints"})
-        profile["layers"].update({"perception", "sensor", "decision_logic"})
 
-    if has_any([
-        "false positive", "false positives", "false negative", "false negatives",
-        "fp", "fn", "validation", "verification", "test", "tests", "scenario", "scenarios",
-    ]):
-        profile["roles"].update({"validation", "test"})
-        profile["facets"].update({"validation", "test_scenarios", "performance", "failure_modes"})
-        profile["stages"].add("verification")
-        profile["flags"].add("has_validation_or_test_evidence")
+def _query_profile_rule_matches(query_lower: str, tokens: set[str], rule: dict[str, Any]) -> bool:
+    """
+    Match a domain-configured query-profile rule.
 
-    if has_any([
-        "degraded", "fallback", "shutdown", "failure", "contamination",
-        "blocked", "lighting", "unavailable", "fault",
-    ]):
-        profile["facets"].update({"failure_modes", "system_behavior", "constraints"})
-        profile["layers"].update({"sensor", "decision_logic", "hmi"})
-        profile["flags"].add("has_failure_or_degraded_mode")
+    The ADAS domain pack intentionally preserves the old behavior: a rule hits
+    if any configured trigger appears as a substring in the lower-cased query or
+    as an exact token. That keeps multi-word triggers such as "blind spot" and
+    short technical triggers such as "CAN" working as before.
+    """
+    triggers = _as_list(rule.get("triggers"))
+    if not triggers:
+        return False
 
-    if has_any(["interface", "can", "gpio", "api", "contract", "integration", "signal"]):
-        profile["roles"].add("interface_contract")
-        profile["facets"].update({"interface", "configuration", "implementation"})
-        profile["layers"].update({"vehicle_integration", "embedded_runtime", "hmi"})
-        profile["flags"].add("has_interface_or_contract")
+    return any(
+        trigger.lower() in query_lower or trigger.lower() in tokens
+        for trigger in triggers
+    )
 
-    if has_any(["deploy", "deployment", "runtime", "embedded", "edge", "latency", "performance", "quantized", "int8"]):
-        profile["roles"].add("deployment")
-        profile["facets"].update({"deployment", "performance", "implementation", "constraints"})
-        profile["layers"].update({"embedded_runtime", "perception"})
-        profile["stages"].update({"implementation", "release"})
 
-    if has_any([
-        "regulation", "regulatory", "compliance", "standard", "standards",
-        "certification", "approval", "ece", "gsr", "iso",
-    ]):
-        profile["roles"].add("regulation")
-        profile["facets"].update({"regulatory", "constraints"})
-        profile["layers"].add("compliance")
-        profile["stages"].update({"verification", "release"})
-        profile["flags"].add("has_regulatory_or_compliance")
+def query_profile(query: str) -> dict[str, set[str]]:
+    q = query.lower()
+    tokens = set(tokenize_query(query))
+    profile = _empty_query_profile()
 
-    if has_any(["data", "annotation", "training", "dataset", "augmentation", "label", "labels"]):
-        profile["roles"].add("data_management")
-        profile["facets"].update({"data", "implementation", "examples"})
-        profile["layers"].add("data_pipeline")
-        profile["stages"].update({"implementation", "verification"})
+    for rule in getattr(DOMAIN, "query_profiles", []):
+        if not _query_profile_rule_matches(q, tokens, rule):
+            continue
+
+        profile["roles"].update(_as_list(rule.get("add_roles")))
+        profile["facets"].update(_as_list(rule.get("add_facets")))
+        profile["layers"].update(_as_list(rule.get("add_layers")))
+        profile["stages"].update(_as_list(rule.get("add_stages")))
+        profile["flags"].update(_as_list(rule.get("add_flags")))
 
     return profile
 

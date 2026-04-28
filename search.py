@@ -51,6 +51,7 @@ def print_config(query: str, top_k: int, pre_k: int):
     print("RAG SEARCH START")
     print("=" * 100)
     print(f"Query: {query}")
+    print(f"Domain: {cfg.get('domain_id', 'unknown')} ({cfg.get('domain_display_name', 'unknown')})")
     print(f"Retrieval mode: {cfg['mode']} (hybrid {cfg['hybrid']})")
     print(f"Collection: {cfg['collection']}")
     print(f"Qdrant URL: {cfg['qdrant_url']}")

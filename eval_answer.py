@@ -82,6 +82,17 @@ MIN_CITATION_COUNT = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CITATIONS", "2"))
 VERBOSE = os.environ.get("RAG_ANSWER_EVAL_VERBOSE", "1") != "0"
 SAVE_PROMPTS = os.environ.get("RAG_ANSWER_EVAL_SAVE_PROMPTS", "1") != "0"
 
+# Eval-only guardrail. This does not change retrieval; it prevents one stochastic
+# malformed generation (loop/truncation/missing citation format) from making the
+# whole regression gate noisy. Set to 0 to evaluate first-shot compliance only.
+REPAIR_ON_CONTRACT_FAILURE = os.environ.get("RAG_ANSWER_EVAL_REPAIR_ON_CONTRACT_FAILURE", "1") != "0"
+MAX_REPAIR_ATTEMPTS = int(os.environ.get("RAG_ANSWER_EVAL_REPAIR_ATTEMPTS", "1"))
+
+# Optional deterministic sampling for answer eval only. By default we do not send
+# sampling params, preserving the llama-server defaults unless explicitly set.
+ANSWER_TEMPERATURE = os.environ.get("RAG_ANSWER_EVAL_TEMPERATURE")
+ANSWER_TOP_P = os.environ.get("RAG_ANSWER_EVAL_TOP_P")
+
 
 # =============================================================================
 # Small utilities
@@ -179,6 +190,10 @@ def call_chat(prompt: str):
         "stream": False,
         "max_tokens": ANSWER_MAX_TOKENS,
     }
+    if ANSWER_TEMPERATURE is not None:
+        payload["temperature"] = float(ANSWER_TEMPERATURE)
+    if ANSWER_TOP_P is not None:
+        payload["top_p"] = float(ANSWER_TOP_P)
 
     started = time.time()
     r = requests.post(CHAT_URL, json=payload, timeout=ANSWER_TIMEOUT)
@@ -355,7 +370,87 @@ def check_required_sections(answer: str):
     return present, failures
 
 
-def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
+
+def repeated_line_hits(text: str, min_repeats: int = 4):
+    """Detect obvious generation loops without judging answer semantics."""
+    hits = []
+    previous = None
+    count = 0
+    for line_no, raw_line in enumerate((text or "").splitlines(), start=1):
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        if not line:
+            continue
+        if len(line) < 12:
+            previous = line
+            count = 1
+            continue
+        if line == previous:
+            count += 1
+            if count == min_repeats:
+                hits.append({"line": line[:180], "line_no": line_no, "repeats": count})
+        else:
+            previous = line
+            count = 1
+    return hits
+
+
+def is_format_or_generation_failure(failures: list[str], finish_reason: str | None) -> bool:
+    """Return True for failures that are safe to retry as formatting/generation repair.
+
+    Do not retry semantic failures such as forbidden answer patterns, metadata/path
+    leaks, or visible reasoning leaks. Those should stay hard failures.
+    """
+    if not failures:
+        return False
+    safe_prefixes = (
+        "missing required section:",
+        "too few source citations:",
+        "no source citations found",
+        "generation loop detected",
+        "generation truncated:",
+        "answer too short:",
+    )
+    unsafe_markers = (
+        "forbidden answer pattern matched",
+        "classification metadata leaked",
+        "full local path leaked",
+        "visible reasoning leak",
+        "raw /rag command leaked",
+        "unclosed <think>",
+    )
+    if any(any(marker in failure for marker in unsafe_markers) for failure in failures):
+        return False
+    if finish_reason == "length":
+        return True
+    return all(any(failure.startswith(prefix) for prefix in safe_prefixes) for failure in failures)
+
+
+def build_repair_prompt(original_prompt: str, previous_answer: str, failures: list[str]) -> str:
+    failure_text = "\n".join(f"- {failure}" for failure in failures[:12])
+    previous_preview = (previous_answer or "")[:5000]
+    return f"""Your previous answer failed the RAG answer-contract check.
+
+Failures:
+{failure_text}
+
+Rewrite the answer using the same retrieved context from the original prompt.
+Follow these rules strictly:
+- Use exactly the six requested sections: 1. Conclusion through 6. Source mapping.
+- Use exact source citations like [S1], [S2]. Do not put chunk ids or extra text inside citation brackets.
+- No [S#] citation means no claim.
+- For missing evidence, cite the retrieved sources reviewed and state what is not specified.
+- Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.
+- Do not repeat the same phrase or bullet.
+- Keep the answer concise.
+
+Original prompt:
+{original_prompt}
+
+Previous malformed answer preview:
+{previous_preview}
+"""
+
+def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_reason: str | None = None):
     failures = []
     warnings = []
 
@@ -371,6 +466,13 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
     min_chars = int(case.get("min_answer_chars") or MIN_ANSWER_CHARS)
     if len(answer) < min_chars:
         failures.append(f"answer too short: chars={len(answer)} min={min_chars}")
+
+    if finish_reason == "length":
+        failures.append("generation truncated: finish_reason=length")
+
+    loop_hits = repeated_line_hits(answer)
+    if loop_hits:
+        failures.append(f"generation loop detected: {loop_hits[:3]}")
 
     sections, section_failures = check_required_sections(answer)
     failures.extend(section_failures)
@@ -446,6 +548,8 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any]):
         "reasoning_hits": reasoning_hits,
         "path_hits": path_hits,
         "metadata_hits": metadata_hits,
+        "loop_hits": loop_hits,
+        "finish_reason": finish_reason,
         "answer_cleanup": cleanup,
     }
 
@@ -499,7 +603,46 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
     print(f"Answer cleanup: {json.dumps(cleanup, ensure_ascii=False)}")
     print(f"Answer preview: {preview(answer)}")
 
-    checks = run_answer_checks(answer, case, cleanup)
+    checks = run_answer_checks(answer, case, cleanup, finish_reason=response["finish_reason"])
+
+    repair_attempts = []
+    if (
+        REPAIR_ON_CONTRACT_FAILURE
+        and MAX_REPAIR_ATTEMPTS > 0
+        and not checks["passed"]
+        and is_format_or_generation_failure(checks["failures"], response["finish_reason"])
+    ):
+        for repair_i in range(1, MAX_REPAIR_ATTEMPTS + 1):
+            print(f"Repair attempt {repair_i}: format/generation-only failure detected")
+            repair_prompt = build_repair_prompt(prompt, answer, checks["failures"])
+            repair_response = call_chat(repair_prompt)
+            repair_answer = repair_response["answer"]
+            repair_cleanup = repair_response["answer_cleanup"]
+            repair_checks = run_answer_checks(
+                repair_answer,
+                case,
+                repair_cleanup,
+                finish_reason=repair_response["finish_reason"],
+            )
+            repair_attempts.append({
+                "attempt": repair_i,
+                "finish_reason": repair_response["finish_reason"],
+                "raw_answer_chars": len(repair_response["raw_answer"]),
+                "answer_chars": len(repair_answer),
+                "passed": repair_checks["passed"],
+                "failures": repair_checks["failures"],
+            })
+            if repair_checks["passed"]:
+                raw_answer = repair_response["raw_answer"]
+                answer = repair_answer
+                cleanup = repair_cleanup
+                response = repair_response
+                checks = repair_checks
+                checks["warnings"].append("answer repaired after first-shot format/generation failure")
+                print(f"Repair attempt {repair_i}: PASS")
+                break
+            print(f"Repair attempt {repair_i}: still failing")
+
     if prompt_warning:
         checks["warnings"].append(prompt_warning)
 
@@ -526,6 +669,7 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
         "finish_reason": response["finish_reason"],
         "reasoning_content_chars": response["reasoning_content_chars"],
         "answer_cleanup": cleanup,
+        "repair_attempts": repair_attempts,
         "usage": response["usage"],
     }
     write_json(case_dir / "result.json", result)
@@ -583,6 +727,7 @@ def main():
     print(f"Chat URL: {CHAT_URL}")
     print(f"Answer max tokens: {ANSWER_MAX_TOKENS}")
     print(f"Answer timeout: {ANSWER_TIMEOUT}")
+    print(f"Repair on contract failure: {REPAIR_ON_CONTRACT_FAILURE}; attempts={MAX_REPAIR_ATTEMPTS}")
     print("Qwen response handling: default server response parsed locally; no response-routing override is sent")
     print(f"Cases: {len(cases)}")
     print("Eval scope: answer contract / grounding hygiene; not full semantic faithfulness.")
