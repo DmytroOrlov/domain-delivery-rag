@@ -67,8 +67,13 @@ import rag_core as rc
 
 
 BASE_DIR = Path(os.environ.get("RAG_BASE_DIR", os.path.expanduser("~/rag_v1")))
-DEFAULT_EVAL_FILE = BASE_DIR / "eval_queries.json"
-RUNS_DIR = Path(os.environ.get("RAG_EVAL_RUNS_DIR", str(BASE_DIR / "eval_runs")))
+DEFAULT_EVAL_FILE = Path(os.environ.get("RAG_EVAL_FILE", rc.DOMAIN.eval_file)).expanduser()
+RUNS_DIR = Path(
+    os.environ.get(
+        "RAG_EVAL_RUNS_DIR",
+        os.environ.get("RAG_EVAL_RUN_DIR", getattr(rc.DOMAIN, "eval_run_dir", str(BASE_DIR / "eval_runs"))),
+    )
+).expanduser()
 
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
 

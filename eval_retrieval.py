@@ -38,6 +38,7 @@ retrieved drop chunks.
 Usage:
   python3 eval_retrieval.py
   python3 eval_retrieval.py blind_spot_warning_implications
+  python3 eval_retrieval.py --case blind_spot_warning_implications
 """
 
 from __future__ import annotations
@@ -50,8 +51,8 @@ from typing import Any
 
 import rag_core as rc
 
-EVAL_FILE = os.environ.get("RAG_EVAL_FILE", rc.DOMAIN.eval_file)
-SOURCE_MAP_FILE = os.environ.get("RAG_EVAL_SOURCE_MAP", rc.DOMAIN.eval_source_map)
+EVAL_FILE = Path(os.environ.get("RAG_EVAL_FILE", rc.DOMAIN.eval_file)).expanduser()
+SOURCE_MAP_FILE = Path(os.environ.get("RAG_EVAL_SOURCE_MAP", rc.DOMAIN.eval_source_map)).expanduser()
 DEFAULT_TOP_K = int(os.environ.get("RAG_EVAL_TOP_K", str(rc.DEFAULT_TOP_K)))
 DEFAULT_PRE_K = int(os.environ.get("RAG_EVAL_PRE_K", str(rc.DEFAULT_PRE_K)))
 DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(rc.DEFAULT_MAX_PER_FILE)))
@@ -292,7 +293,7 @@ def print_case_result(case: dict[str, Any], selected: list[dict[str, Any]], grou
 
 
 def load_cases() -> list[dict[str, Any]]:
-    path = Path(EVAL_FILE)
+    path = Path(EVAL_FILE).expanduser()
     if not path.exists():
         raise SystemExit(f"Eval file not found: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -302,7 +303,13 @@ def load_cases() -> list[dict[str, Any]]:
 
 
 def main():
-    only_id = sys.argv[1] if len(sys.argv) > 1 else None
+    only_id = None
+    args = sys.argv[1:]
+    if args:
+        if args[0] == "--case" and len(args) >= 2:
+            only_id = args[1]
+        else:
+            only_id = args[0]
     source_map = load_source_map()
     cases = load_cases()
     if only_id:

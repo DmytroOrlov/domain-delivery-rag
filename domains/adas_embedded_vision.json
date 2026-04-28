@@ -4,8 +4,8 @@
   "collection": "rag_v1_chunks",
   "input_dir": "files",
   "failure_dir": "metadata_failures",
-  "eval_file": "eval_queries.json",
-  "eval_source_map": "eval_source_map.local.json",
+  "eval_file": "evals/adas_embedded_vision/eval_queries.json",
+  "eval_source_map": "evals/adas_embedded_vision/eval_source_map.local.json",
   "eval_run_dir": "eval_runs",
   "answer_persona": "You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.",
   "retrieval_defaults": {
