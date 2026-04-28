@@ -5,9 +5,9 @@ Shared dense-retrieval core for the local ADAS / Embedded Vision Delivery RAG v1
 This module is the single source of truth for the v1 runtime retrieval contract.
 
 Scope note:
-  Query-profile rules are now loaded from the active domain config. Ingest
-  ontology and metadata-prior weights are still domain-specific in code and are
-  expected to move into the domain pack in later refactors.
+  Query-profile rules and metadata-prior weights are loaded from the active
+  domain config. Ingest ontology is still domain-specific in code and is
+  expected to move into the domain pack in a later refactor.
 
 Runtime contract:
 
@@ -80,8 +80,10 @@ CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(DOMAIN.conte
 # RAG_METADATA_PRIOR=0 disables the heuristic globally for normal callers.
 # Ablation code can also override it per call through retrieve_dense(...,
 # use_metadata_prior=False).
-META_MIN = -0.045
-META_MAX = 0.050
+RERANK_CONFIG = getattr(DOMAIN, "rerank", {}) or {}
+RERANK_CLAMP = RERANK_CONFIG.get("clamp", [-0.045, 0.050])
+META_MIN = float(os.environ.get("RAG_META_MIN", str(RERANK_CLAMP[0])))
+META_MAX = float(os.environ.get("RAG_META_MAX", str(RERANK_CLAMP[1])))
 METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
@@ -251,45 +253,45 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+def _value_weight(weights: dict[str, Any], field: str, value: Any) -> float:
+    field_weights = weights.get(field, {})
+    try:
+        return float(field_weights.get(str(value), 0.0))
+    except Exception:
+        return 0.0
+
+
+def _hit_weight(hit_cfg: dict[str, Any], hits: int) -> float:
+    if not hits:
+        return 0.0
+    per_hit = float(hit_cfg.get("per_hit", 0.0))
+    cap = float(hit_cfg.get("cap", per_hit * hits))
+    return min(hits * per_hit, cap)
+
+
 def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     """
     Bounded heuristic rerank.
 
     Classification metadata is a routing/ranking signal only. It is not placed in
     answer evidence and should not be cited by the model.
+
+    The mechanism is generic; the weights are domain policy and are loaded from
+    the active domain config.
     """
     bonus = 0.0
+    rerank = RERANK_CONFIG
+    base_weights = rerank.get("base_weights", {})
+    hit_weights = rerank.get("hit_weights", {})
 
-    corpus_decision = payload.get("corpus_decision")
-    delivery_value = payload.get("delivery_value")
-    safety_relevance = payload.get("safety_relevance")
-    chunk_role = payload.get("chunk_role")
-    confidence = payload.get("confidence") or 0.0
-
-    if corpus_decision == "primary":
-        bonus += 0.005
-    elif corpus_decision == "drop":
-        bonus -= 0.040
-
-    if delivery_value == "high":
-        bonus += 0.005
-    elif delivery_value == "medium":
-        bonus += 0.002
-    elif delivery_value == "low":
-        bonus -= 0.002
-
-    if safety_relevance == "high":
-        bonus += 0.004
-    elif safety_relevance == "medium":
-        bonus += 0.001
-
-    if chunk_role == "noise":
-        bonus -= 0.040
-    elif chunk_role == "unknown":
-        bonus -= 0.010
+    bonus += _value_weight(base_weights, "corpus_decision", payload.get("corpus_decision"))
+    bonus += _value_weight(base_weights, "delivery_value", payload.get("delivery_value"))
+    bonus += _value_weight(base_weights, "safety_relevance", payload.get("safety_relevance"))
+    bonus += _value_weight(base_weights, "chunk_role", payload.get("chunk_role"))
 
     try:
-        bonus += min(float(confidence), 1.0) * 0.0025
+        confidence_weight = float(rerank.get("confidence_weight", 0.0))
+        bonus += min(float(payload.get("confidence") or 0.0), 1.0) * confidence_weight
     except Exception:
         pass
 
@@ -300,14 +302,15 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     layer_hits = _intersect_count(payload.get("system_layers"), profile["layers"])
     stage_hits = _intersect_count(payload.get("workflow_stages"), profile["stages"])
 
-    bonus += min(role_hits * 0.005, 0.008)
-    bonus += min(facet_hits * 0.004, 0.016)
-    bonus += min(layer_hits * 0.003, 0.009)
-    bonus += min(stage_hits * 0.002, 0.006)
+    bonus += _hit_weight(hit_weights.get("role", {}), role_hits)
+    bonus += _hit_weight(hit_weights.get("facet", {}), facet_hits)
+    bonus += _hit_weight(hit_weights.get("layer", {}), layer_hits)
+    bonus += _hit_weight(hit_weights.get("stage", {}), stage_hits)
 
+    flag_weight = float(hit_weights.get("flag", 0.0))
     for flag in profile["flags"]:
         if payload.get(flag) is True:
-            bonus += 0.005
+            bonus += flag_weight
 
     return _clamp(bonus, META_MIN, META_MAX)
 

@@ -6,8 +6,8 @@ Default domain:
   RAG_DOMAIN=adas_embedded_vision
 
 The loader intentionally starts small. It creates a domain boundary for runtime
-paths/defaults/persona and query profiling rules without moving metadata prior
-or ingest ontology yet.
+paths/defaults/persona, query profiling rules, and metadata-prior
+weights without moving ingest ontology yet.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ class DomainConfig:
     retrieval_defaults: dict[str, Any]
     context_defaults: dict[str, Any]
     query_profiles: list[dict[str, Any]]
+    rerank: dict[str, Any]
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "DomainConfig":
@@ -52,6 +53,7 @@ class DomainConfig:
             retrieval_defaults=dict(data.get("retrieval_defaults", {})),
             context_defaults=dict(data.get("context_defaults", {})),
             query_profiles=list(data.get("query_profiles", [])),
+            rerank=dict(data.get("rerank", {})),
         )
 
 
