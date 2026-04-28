@@ -9,14 +9,16 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+from domain_config import load_domain_config
+
 # =============================================================================
 # ADAS / Embedded Vision Delivery RAG - Ingestion Pipeline
 # =============================================================================
 #
 # This is a local v1 pipeline for safety-relevant embedded vision / ADAS-style
 # corpora. It is not a generic production RAG framework yet. Domain-specific
-# ontology and metadata are intentionally kept explicit so they can be reviewed,
-# measured, and later moved into configuration if the project becomes multi-domain.
+# ontology and metadata schema values are loaded from the active domain config.
+# The extraction prompt template is still explicit here and is the next planned seam.
 # =============================================================================
 #
 # Flow:
@@ -37,13 +39,15 @@ from qdrant_client.http import models
 # =============================================================================
 
 
-INPUT_DIR = os.path.expanduser("files")
-FAILURE_DIR = os.path.expanduser("metadata_failures")
+DOMAIN = load_domain_config()
+
+INPUT_DIR = os.path.expanduser(os.environ.get("RAG_INPUT_DIR", DOMAIN.input_dir))
+FAILURE_DIR = os.path.expanduser(os.environ.get("RAG_FAILURE_DIR", DOMAIN.failure_dir))
 
 EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
 QDRANT_URL = os.environ.get("RAG_QDRANT_URL", "http://127.0.0.1:6333")
-COLLECTION = os.environ.get("RAG_COLLECTION", "rag_v1_chunks")
+COLLECTION = os.environ.get("RAG_COLLECTION", DOMAIN.collection)
 
 # CHUNK_SIZE is a target, not a hard maximum.
 # Paragraph/heading-aware chunking preserves readable units and overlap as much
@@ -73,7 +77,7 @@ TEXT_EXTS = {".txt", ".md", ".rst", ".json", ".yaml", ".yml", ".xml", ".csv"}
 # Metadata schema
 # =============================================================================
 
-CHUNK_ROLE_VALUES = {
+DEFAULT_CHUNK_ROLE_VALUES = {
     "overview",
     "requirements",
     "architecture",
@@ -93,7 +97,7 @@ CHUNK_ROLE_VALUES = {
     "unknown",
 }
 
-CONTENT_FACET_VALUES = {
+DEFAULT_CONTENT_FACET_VALUES = {
     "system_behavior",
     "constraints",
     "interface",
@@ -113,7 +117,7 @@ CONTENT_FACET_VALUES = {
     "unknown",
 }
 
-SYSTEM_LAYER_VALUES = {
+DEFAULT_SYSTEM_LAYER_VALUES = {
     "sensor",
     "perception",
     "decision_logic",
@@ -127,7 +131,7 @@ SYSTEM_LAYER_VALUES = {
     "unknown",
 }
 
-WORKFLOW_STAGE_VALUES = {
+DEFAULT_WORKFLOW_STAGE_VALUES = {
     "discovery",
     "implementation",
     "verification",
@@ -136,9 +140,51 @@ WORKFLOW_STAGE_VALUES = {
     "unknown",
 }
 
-SAFETY_RELEVANCE_VALUES = {"high", "medium", "low", "unknown"}
-DELIVERY_VALUE_VALUES = {"high", "medium", "low"}
-CORPUS_DECISION_VALUES = {"primary", "secondary", "drop"}
+DEFAULT_SAFETY_RELEVANCE_VALUES = {"high", "medium", "low", "unknown"}
+DEFAULT_DELIVERY_VALUE_VALUES = {"high", "medium", "low"}
+DEFAULT_CORPUS_DECISION_VALUES = {"primary", "secondary", "drop"}
+DEFAULT_BOOLEAN_FLAG_FIELDS = (
+    "has_behavioral_requirements",
+    "has_interface_or_contract",
+    "has_validation_or_test_evidence",
+    "has_failure_or_degraded_mode",
+    "has_regulatory_or_compliance",
+)
+
+
+def schema_values(field: str, default_values) -> set[str]:
+    values = DOMAIN.metadata_schema.get(field, default_values)
+    if not isinstance(values, (list, tuple, set)) or not values:
+        raise ValueError(f"metadata_schema.{field} must be a non-empty list")
+    result = set()
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"metadata_schema.{field} values must be non-empty strings")
+        result.add(value)
+    return result
+
+
+def schema_list(field: str, default_values) -> list[str]:
+    values = DOMAIN.metadata_schema.get(field, default_values)
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ValueError(f"metadata_schema.{field} must be a non-empty list")
+    result = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"metadata_schema.{field} values must be non-empty strings")
+        if value not in result:
+            result.append(value)
+    return result
+
+
+CHUNK_ROLE_VALUES = schema_values("chunk_role", DEFAULT_CHUNK_ROLE_VALUES)
+CONTENT_FACET_VALUES = schema_values("content_facets", DEFAULT_CONTENT_FACET_VALUES)
+SYSTEM_LAYER_VALUES = schema_values("system_layers", DEFAULT_SYSTEM_LAYER_VALUES)
+WORKFLOW_STAGE_VALUES = schema_values("workflow_stages", DEFAULT_WORKFLOW_STAGE_VALUES)
+SAFETY_RELEVANCE_VALUES = schema_values("safety_relevance", DEFAULT_SAFETY_RELEVANCE_VALUES)
+DELIVERY_VALUE_VALUES = schema_values("delivery_value", DEFAULT_DELIVERY_VALUE_VALUES)
+CORPUS_DECISION_VALUES = schema_values("corpus_decision", DEFAULT_CORPUS_DECISION_VALUES)
+BOOLEAN_FLAG_FIELDS = tuple(schema_list("boolean_flags", DEFAULT_BOOLEAN_FLAG_FIELDS))
 
 SAFETY_RANK = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
 DELIVERY_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -580,7 +626,7 @@ def validate_chunk_metadata(raw):
     if not isinstance(raw, dict):
         raise MetadataValidationError("metadata must be a JSON object")
 
-    return {
+    metadata = {
         "chunk_role": require_enum(raw, "chunk_role", CHUNK_ROLE_VALUES),
         "content_facets": require_list_enum(raw, "content_facets", CONTENT_FACET_VALUES),
         "system_layers": require_list_enum(raw, "system_layers", SYSTEM_LAYER_VALUES),
@@ -588,24 +634,29 @@ def validate_chunk_metadata(raw):
         "safety_relevance": require_enum(raw, "safety_relevance", SAFETY_RELEVANCE_VALUES),
         "delivery_value": require_enum(raw, "delivery_value", DELIVERY_VALUE_VALUES),
         "corpus_decision": require_enum(raw, "corpus_decision", CORPUS_DECISION_VALUES),
-        "has_behavioral_requirements": require_bool(raw, "has_behavioral_requirements"),
-        "has_interface_or_contract": require_bool(raw, "has_interface_or_contract"),
-        "has_validation_or_test_evidence": require_bool(raw, "has_validation_or_test_evidence"),
-        "has_failure_or_degraded_mode": require_bool(raw, "has_failure_or_degraded_mode"),
-        "has_regulatory_or_compliance": require_bool(raw, "has_regulatory_or_compliance"),
-        "confidence": require_confidence(raw),
-        "reason_short": str(raw.get("reason_short", ""))[:160],
     }
+
+    for flag in BOOLEAN_FLAG_FIELDS:
+        metadata[flag] = require_bool(raw, flag)
+
+    metadata["confidence"] = require_confidence(raw)
+    metadata["reason_short"] = str(raw.get("reason_short", ""))[:160]
+    return metadata
 
 
 def compact_item_to_metadata(item):
     if not isinstance(item, list):
         raise MetadataValidationError(f"compact item must be list, got {type(item).__name__}")
 
-    if len(item) != 15:
-        raise MetadataValidationError(f"compact item must have 15 fields, got {len(item)}: {item!r}")
+    expected_len = 10 + len(BOOLEAN_FLAG_FIELDS)
+    if len(item) != expected_len:
+        raise MetadataValidationError(
+            f"compact item must have {expected_len} fields, got {len(item)}: {item!r}"
+        )
 
     chunk_index = normalize_chunk_index(item[0])
+    flag_start = 8
+    flag_end = flag_start + len(BOOLEAN_FLAG_FIELDS)
 
     raw_metadata = {
         "chunk_role": item[1],
@@ -615,14 +666,12 @@ def compact_item_to_metadata(item):
         "safety_relevance": item[5],
         "delivery_value": item[6],
         "corpus_decision": item[7],
-        "has_behavioral_requirements": item[8],
-        "has_interface_or_contract": item[9],
-        "has_validation_or_test_evidence": item[10],
-        "has_failure_or_degraded_mode": item[11],
-        "has_regulatory_or_compliance": item[12],
-        "confidence": item[13],
-        "reason_short": item[14],
+        "confidence": item[flag_end],
+        "reason_short": item[flag_end + 1],
     }
+
+    for offset, flag in enumerate(BOOLEAN_FLAG_FIELDS):
+        raw_metadata[flag] = item[flag_start + offset]
 
     return chunk_index, validate_chunk_metadata(raw_metadata)
 
@@ -692,6 +741,33 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
     allowed_safety_relevance = ", ".join(sorted(SAFETY_RELEVANCE_VALUES))
     allowed_delivery_value = ", ".join(sorted(DELIVERY_VALUE_VALUES))
     allowed_corpus_decision = ", ".join(sorted(CORPUS_DECISION_VALUES))
+    boolean_flag_fields = ", ".join(BOOLEAN_FLAG_FIELDS)
+    compact_row_fields = ",\n      ".join([
+        "chunk_index",
+        "chunk_role",
+        "content_facets",
+        "system_layers",
+        "workflow_stages",
+        "safety_relevance",
+        "delivery_value",
+        "corpus_decision",
+        *BOOLEAN_FLAG_FIELDS,
+        "confidence",
+        "reason_short",
+    ])
+    compact_example_item = [
+        0,
+        "test",
+        ["validation"],
+        ["perception"],
+        ["verification"],
+        "high",
+        "high",
+        "primary",
+        *([False] * len(BOOLEAN_FLAG_FIELDS)),
+        0.85,
+        "Short reason.",
+    ]
 
     start_chunk_index = batch_chunks[0]["chunk_index"] if batch_chunks else -1
     expected_indices = [x["chunk_index"] for x in batch_chunks]
@@ -725,6 +801,7 @@ workflow_stages: {allowed_workflow_stages}
 safety_relevance: {allowed_safety_relevance}
 delivery_value: {allowed_delivery_value}
 corpus_decision: {allowed_corpus_decision}
+boolean flags: {boolean_flag_fields}
 
 Definitions:
 - chunk_role: the primary role of this chunk.
@@ -734,6 +811,7 @@ Definitions:
 - safety_relevance: high only if this chunk directly affects safety behavior, safety assurance, compliance, validation, failure/degraded modes, or safety-critical deployment.
 - delivery_value: high only if this chunk helps implementation, verification, release, debugging, integration, or decision-making.
 - corpus_decision: primary if this chunk should be indexed for v1 delivery RAG; secondary if useful but not core; drop if mostly noise.
+- boolean flags: true only when the chunk explicitly contains that type of evidence.
 
 Return compact JSON only.
 
@@ -741,27 +819,13 @@ Output schema:
 {{
   "items": [
     [
-      chunk_index,
-      chunk_role,
-      content_facets,
-      system_layers,
-      workflow_stages,
-      safety_relevance,
-      delivery_value,
-      corpus_decision,
-      has_behavioral_requirements,
-      has_interface_or_contract,
-      has_validation_or_test_evidence,
-      has_failure_or_degraded_mode,
-      has_regulatory_or_compliance,
-      confidence,
-      reason_short
+{compact_row_fields}
     ]
   ]
 }}
 
 Example item:
-[0, "test", ["validation"], ["perception"], ["verification"], "high", "high", "primary", false, false, true, false, false, 0.85, "Short reason."]
+{json.dumps(compact_example_item, ensure_ascii=False)}
 
 Chunks:
 {json.dumps(batch_chunks, ensure_ascii=False, indent=2)}
@@ -1113,6 +1177,7 @@ def main():
     print("=" * 100)
     print("RAG INGEST START")
     print("=" * 100)
+    print(f"Domain: {DOMAIN.id} ({DOMAIN.display_name})")
     print(f"Input dir: {INPUT_DIR}")
     print(f"Collection: {COLLECTION}")
     print(f"Qdrant URL: {QDRANT_URL}")

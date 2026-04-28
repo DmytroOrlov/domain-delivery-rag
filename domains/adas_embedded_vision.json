@@ -321,5 +321,89 @@
       "Do not repeat the same phrase or bullet.",
       "Keep the answer concise."
     ]
+  },
+  "metadata_schema": {
+    "chunk_role": [
+      "overview",
+      "requirements",
+      "architecture",
+      "interface_contract",
+      "configuration",
+      "deployment",
+      "validation",
+      "test",
+      "regulation",
+      "operations",
+      "data_management",
+      "monitoring",
+      "incident",
+      "simulation",
+      "example",
+      "noise",
+      "unknown"
+    ],
+    "content_facets": [
+      "system_behavior",
+      "constraints",
+      "interface",
+      "configuration",
+      "validation",
+      "test_scenarios",
+      "failure_modes",
+      "monitoring",
+      "deployment",
+      "data",
+      "regulatory",
+      "examples",
+      "implementation",
+      "performance",
+      "security",
+      "privacy",
+      "unknown"
+    ],
+    "system_layers": [
+      "sensor",
+      "perception",
+      "decision_logic",
+      "hmi",
+      "embedded_runtime",
+      "data_pipeline",
+      "vehicle_integration",
+      "ops_monitoring",
+      "compliance",
+      "simulation",
+      "unknown"
+    ],
+    "workflow_stages": [
+      "discovery",
+      "implementation",
+      "verification",
+      "release",
+      "operation",
+      "unknown"
+    ],
+    "safety_relevance": [
+      "high",
+      "medium",
+      "low",
+      "unknown"
+    ],
+    "delivery_value": [
+      "high",
+      "medium",
+      "low"
+    ],
+    "corpus_decision": [
+      "primary",
+      "secondary",
+      "drop"
+    ],
+    "boolean_flags": [
+      "has_behavioral_requirements",
+      "has_interface_or_contract",
+      "has_validation_or_test_evidence",
+      "has_failure_or_degraded_mode",
+      "has_regulatory_or_compliance"
+    ]
   }
 }

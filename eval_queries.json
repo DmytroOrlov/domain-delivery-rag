@@ -363,18 +363,10 @@
           5,
           6
         ]
-      },
-      {
-        "source": "edge_ai_product",
-        "chunks": [
-          0,
-          1,
-          2
-        ]
       }
     ],
     "forbidden_sources": [],
-    "notes": "Architecture constraint case. It checks whether retrieval can surface embedded/on-device, no-cloud, and ECU/external-control-unit evidence without requiring all possible supporting sources to appear."
+    "notes": "Architecture constraint case. It checks whether retrieval can surface embedded/on-device, no-cloud, and ECU/external-control-unit evidence without requiring all possible supporting sources to appear. The primary chunk-level expectation is kept on the deployment handbook; edge product evidence is allowed via expected_sources_any but not required by exact chunk id."
   },
   {
     "id": "rollback_update_unknowns",
