@@ -76,7 +76,7 @@ llama-server payload. The proxy must not second-guess or override it.
 Architecture
 ------------
     Browser UI -> rag_proxy.py (:8088) -> llama-server chat (:8080)
-                                  -> rag_core.py retrieval/context packing
+                                  -> rag_core.py retrieval/context packing + domain prompt rendering
                                   -> embedding server (:8081)
                                   -> Qdrant (:6333)
 
@@ -89,6 +89,8 @@ Runtime semantics
       but classification metadata is not included as answer evidence.
     - Full local source paths are not placed in the LLM prompt; prompt
       provenance uses source id, file name, and chunk ids.
+    - The answer persona/citation/section contract is rendered by rag_core
+      from the active domain config.
 
 Security / privacy
 ------------------

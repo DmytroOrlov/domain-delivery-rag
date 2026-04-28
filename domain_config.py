@@ -7,7 +7,7 @@ Default domain:
 
 The loader intentionally starts small. It creates a domain boundary for runtime
 paths/defaults/persona, query profiling rules, and metadata-prior
-weights without moving ingest ontology yet.
+weights and answer contract without moving ingest ontology yet.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ class DomainConfig:
     eval_source_map: str
     eval_run_dir: str
     answer_persona: str
+    answer: dict[str, Any]
     retrieval_defaults: dict[str, Any]
     context_defaults: dict[str, Any]
     query_profiles: list[dict[str, Any]]
@@ -40,6 +41,14 @@ class DomainConfig:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "DomainConfig":
+        answer = dict(data.get("answer", {}))
+        legacy_persona = data.get("answer_persona")
+        persona = str(answer.get("persona") or legacy_persona or "You are a senior domain delivery assistant.")
+
+        # Keep the legacy field for old callers, but make the structured answer
+        # contract the preferred source for prompt rendering and repair prompts.
+        answer.setdefault("persona", persona)
+
         return DomainConfig(
             id=str(data["id"]),
             display_name=str(data["display_name"]),
@@ -49,7 +58,8 @@ class DomainConfig:
             eval_file=str(data.get("eval_file", "eval_queries.json")),
             eval_source_map=str(data.get("eval_source_map", "eval_source_map.local.json")),
             eval_run_dir=str(data.get("eval_run_dir", "eval_runs")),
-            answer_persona=str(data["answer_persona"]),
+            answer_persona=persona,
+            answer=answer,
             retrieval_defaults=dict(data.get("retrieval_defaults", {})),
             context_defaults=dict(data.get("context_defaults", {})),
             query_profiles=list(data.get("query_profiles", [])),

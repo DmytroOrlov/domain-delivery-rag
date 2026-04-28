@@ -89,6 +89,102 @@ METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
 
+DEFAULT_ANSWER_GROUNDING_RULES = [
+    "Use the retrieved context first.",
+    "The retrieved chunk text is the source of truth.",
+    "Use source ids, file names, and chunk ids only for citation/source mapping.",
+    "Separate supported facts from inference.",
+    "If the retrieved context does not support a claim, say so explicitly.",
+    "Be conservative with safety-relevant claims.",
+]
+
+DEFAULT_CITATION_RULE = (
+    "Citation rule: use only exact citations like [S1], [S2]. Do not put chunk ids, "
+    "file names, commas, or extra text inside citation brackets. No [S#] citation "
+    "means no claim. Cite every factual claim, inference, limitation, and "
+    '"not specified" statement.'
+)
+
+DEFAULT_ANSWER_SECTIONS = [
+    "Conclusion",
+    "Supported facts",
+    "Inferences",
+    "Implementation implications",
+    "Unknowns / verification needed",
+    "Source mapping",
+]
+
+DEFAULT_REPAIR_RULES = [
+    "Use the same retrieved context from the original prompt.",
+    "Use exact source citations like [S1], [S2]. Do not put chunk ids, file names, commas, or extra text inside citation brackets.",
+    "No [S#] citation means no claim.",
+    "For missing evidence, cite the retrieved sources reviewed and state what is not specified.",
+    "Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.",
+    "Do not repeat the same phrase or bullet.",
+    "Keep the answer concise.",
+]
+
+
+def answer_config() -> dict[str, Any]:
+    return dict(getattr(DOMAIN, "answer", {}) or {})
+
+
+def answer_persona() -> str:
+    cfg = answer_config()
+    return str(cfg.get("persona") or getattr(DOMAIN, "answer_persona", "You are a senior domain delivery assistant."))
+
+
+def answer_grounding_rules() -> list[str]:
+    cfg = answer_config()
+    rules = cfg.get("grounding_rules") or DEFAULT_ANSWER_GROUNDING_RULES
+    return [str(rule) for rule in rules if str(rule).strip()]
+
+
+def answer_citation_rule() -> str:
+    cfg = answer_config()
+    return str(cfg.get("citation_rule") or DEFAULT_CITATION_RULE)
+
+
+def answer_sections() -> list[str]:
+    cfg = answer_config()
+    sections = cfg.get("sections") or DEFAULT_ANSWER_SECTIONS
+    return [str(section) for section in sections if str(section).strip()]
+
+
+def answer_repair_rules() -> list[str]:
+    cfg = answer_config()
+    rules = cfg.get("repair_rules") or DEFAULT_REPAIR_RULES
+    return [str(rule) for rule in rules if str(rule).strip()]
+
+
+def render_answer_format(sections: list[str] | None = None) -> str:
+    sections = sections or answer_sections()
+    return "\n".join(f"{idx}. {section}" for idx, section in enumerate(sections, start=1))
+
+
+def render_answer_prompt(question: str, context: str) -> str:
+    """Render the domain answer prompt from the active domain config.
+
+    Retrieval/context assembly is engine code; answer persona, grounding rules,
+    citation policy, and section contract are domain policy.
+    """
+    grounding = "\n".join(answer_grounding_rules())
+    return f"""{answer_persona()}
+
+{grounding}
+
+{answer_citation_rule()}
+
+Answer format:
+{render_answer_format()}
+
+Question:
+{question}
+
+Retrieved context:
+{context}
+"""
+
 
 # =============================================================================
 # Data containers
@@ -643,31 +739,7 @@ def build_augmented_prompt(
         include_full_path=False,
     )
 
-    prompt = f"""{DOMAIN.answer_persona}
-
-Use the retrieved context first.
-The retrieved chunk text is the source of truth.
-Use source ids, file names, and chunk ids only for citation/source mapping.
-Separate supported facts from inference.
-If the retrieved context does not support a claim, say so explicitly.
-Be conservative with safety-relevant claims.
-
-Citation rule: no [S#] citation means no claim. Cite every factual claim, inference, limitation, and "not specified" statement.
-
-Answer format:
-1. Conclusion
-2. Supported facts
-3. Inferences
-4. Implementation implications
-5. Unknowns / verification needed
-6. Source mapping
-
-Question:
-{question}
-
-Retrieved context:
-{context}
-"""
+    prompt = render_answer_prompt(question=question, context=context)
 
     debug_info = {
         "top_k": top_k,
@@ -679,6 +751,7 @@ Retrieved context:
         "source_groups_count": len(source_groups),
         "context_chars": len(context),
         "prompt_chars": len(prompt),
+        "answer_sections": answer_sections(),
         "source_groups": source_groups,
         "selected": selected,
         "candidates": candidates,

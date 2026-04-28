@@ -428,20 +428,45 @@ def is_format_or_generation_failure(failures: list[str], finish_reason: str | No
 def build_repair_prompt(original_prompt: str, previous_answer: str, failures: list[str]) -> str:
     failure_text = "\n".join(f"- {failure}" for failure in failures[:12])
     previous_preview = (previous_answer or "")[:5000]
+
+    sections = rc.render_answer_format() if hasattr(rc, "render_answer_format") else (
+        "1. Conclusion\n"
+        "2. Supported facts\n"
+        "3. Inferences\n"
+        "4. Implementation implications\n"
+        "5. Unknowns / verification needed\n"
+        "6. Source mapping"
+    )
+    citation_rule = rc.answer_citation_rule() if hasattr(rc, "answer_citation_rule") else (
+        "Citation rule: use only exact citations like [S1], [S2]. "
+        "Do not put chunk ids, file names, commas, or extra text inside citation brackets. "
+        "No [S#] citation means no claim."
+    )
+    repair_rules = rc.answer_repair_rules() if hasattr(rc, "answer_repair_rules") else [
+        "Use the same retrieved context from the original prompt.",
+        "Use exact source citations like [S1], [S2]. Do not put chunk ids or extra text inside citation brackets.",
+        "No [S#] citation means no claim.",
+        "For missing evidence, cite the retrieved sources reviewed and state what is not specified.",
+        "Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.",
+        "Do not repeat the same phrase or bullet.",
+        "Keep the answer concise.",
+    ]
+    repair_rules_text = "\n".join(f"- {rule}" for rule in repair_rules)
+
     return f"""Your previous answer failed the RAG answer-contract check.
 
 Failures:
 {failure_text}
 
 Rewrite the answer using the same retrieved context from the original prompt.
-Follow these rules strictly:
-- Use exactly the six requested sections: 1. Conclusion through 6. Source mapping.
-- Use exact source citations like [S1], [S2]. Do not put chunk ids or extra text inside citation brackets.
-- No [S#] citation means no claim.
-- For missing evidence, cite the retrieved sources reviewed and state what is not specified.
-- Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.
-- Do not repeat the same phrase or bullet.
-- Keep the answer concise.
+
+Required answer format:
+{sections}
+
+{citation_rule}
+
+Repair rules:
+{repair_rules_text}
 
 Original prompt:
 {original_prompt}

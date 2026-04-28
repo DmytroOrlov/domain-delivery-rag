@@ -292,5 +292,34 @@
       },
       "flag": 0.005
     }
+  },
+  "answer": {
+    "persona": "You are a senior domain delivery assistant for safety-relevant embedded vision / ADAS.",
+    "grounding_rules": [
+      "Use the retrieved context first.",
+      "The retrieved chunk text is the source of truth.",
+      "Use source ids, file names, and chunk ids only for citation/source mapping.",
+      "Separate supported facts from inference.",
+      "If the retrieved context does not support a claim, say so explicitly.",
+      "Be conservative with safety-relevant claims."
+    ],
+    "citation_rule": "Citation rule: use only exact citations like [S1], [S2]. Do not put chunk ids, file names, commas, or extra text inside citation brackets. No [S#] citation means no claim. Cite every factual claim, inference, limitation, and \"not specified\" statement.",
+    "sections": [
+      "Conclusion",
+      "Supported facts",
+      "Inferences",
+      "Implementation implications",
+      "Unknowns / verification needed",
+      "Source mapping"
+    ],
+    "repair_rules": [
+      "Use the same retrieved context from the original prompt.",
+      "Use exact source citations like [S1], [S2]. Do not put chunk ids, file names, commas, or extra text inside citation brackets.",
+      "No [S#] citation means no claim.",
+      "For missing evidence, cite the retrieved sources reviewed and state what is not specified.",
+      "Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.",
+      "Do not repeat the same phrase or bullet.",
+      "Keep the answer concise."
+    ]
   }
 }
