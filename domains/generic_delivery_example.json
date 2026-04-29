@@ -239,7 +239,8 @@
       "stages": "Lifecycle stages discussed by the chunk.",
       "criticality": "Business or delivery impact of the evidence.",
       "delivery_value": "Usefulness for implementation, validation, release, or operation decisions.",
-      "decision": "primary for high-value evidence, secondary for support, drop for low-signal chunks."
+      "decision": "primary for high-value evidence, secondary for support, drop for low-signal chunks.",
+      "boolean_flags": "true only when the chunk explicitly contains that type of delivery evidence."
     },
     "return_instruction": "Return JSON mapping chunk index to metadata object. Do not include markdown."
   },

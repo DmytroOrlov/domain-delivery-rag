@@ -35,7 +35,7 @@ from domain_config import load_domain_config
 # Important:
 #   - This script still does full re-ingest by design.
 #   - Incremental ingest / cache / manifest are intentionally not implemented yet.
-#   - Chunks marked corpus_decision="drop" are not indexed by default.
+#   - Chunks with the active domain decision value configured as drop are not indexed by default.
 # =============================================================================
 
 
@@ -77,83 +77,13 @@ TEXT_EXTS = {".txt", ".md", ".rst", ".json", ".yaml", ".yml", ".xml", ".csv"}
 # Metadata schema
 # =============================================================================
 
-DEFAULT_CHUNK_ROLE_VALUES = {
-    "overview",
-    "requirements",
-    "architecture",
-    "interface_contract",
-    "configuration",
-    "deployment",
-    "validation",
-    "test",
-    "regulation",
-    "operations",
-    "data_management",
-    "monitoring",
-    "incident",
-    "simulation",
-    "example",
-    "noise",
-    "unknown",
-}
-
-DEFAULT_CONTENT_FACET_VALUES = {
-    "system_behavior",
-    "constraints",
-    "interface",
-    "configuration",
-    "validation",
-    "test_scenarios",
-    "failure_modes",
-    "monitoring",
-    "deployment",
-    "data",
-    "regulatory",
-    "examples",
-    "implementation",
-    "performance",
-    "security",
-    "privacy",
-    "unknown",
-}
-
-DEFAULT_SYSTEM_LAYER_VALUES = {
-    "sensor",
-    "perception",
-    "decision_logic",
-    "hmi",
-    "embedded_runtime",
-    "data_pipeline",
-    "vehicle_integration",
-    "ops_monitoring",
-    "compliance",
-    "simulation",
-    "unknown",
-}
-
-DEFAULT_WORKFLOW_STAGE_VALUES = {
-    "discovery",
-    "implementation",
-    "verification",
-    "release",
-    "operation",
-    "unknown",
-}
-
-DEFAULT_SAFETY_RELEVANCE_VALUES = {"high", "medium", "low", "unknown"}
-DEFAULT_DELIVERY_VALUE_VALUES = {"high", "medium", "low"}
-DEFAULT_CORPUS_DECISION_VALUES = {"primary", "secondary", "drop"}
-DEFAULT_BOOLEAN_FLAG_FIELDS = (
-    "has_behavioral_requirements",
-    "has_interface_or_contract",
-    "has_validation_or_test_evidence",
-    "has_failure_or_degraded_mode",
-    "has_regulatory_or_compliance",
-)
+# Runtime schema values are loaded exclusively from DOMAIN.metadata_schema.
 
 
-def schema_values(field: str, default_values) -> set[str]:
-    values = DOMAIN.metadata_schema.get(field, default_values)
+def schema_values(field: str) -> set[str]:
+    if field not in DOMAIN.metadata_schema:
+        raise ValueError(f"metadata_schema.{field} is required in the active domain config")
+    values = DOMAIN.metadata_schema[field]
     if not isinstance(values, (list, tuple, set)) or not values:
         raise ValueError(f"metadata_schema.{field} must be a non-empty list")
     result = set()
@@ -164,8 +94,10 @@ def schema_values(field: str, default_values) -> set[str]:
     return result
 
 
-def schema_list(field: str, default_values) -> list[str]:
-    values = DOMAIN.metadata_schema.get(field, default_values)
+def schema_list(field: str) -> list[str]:
+    if field not in DOMAIN.metadata_schema:
+        raise ValueError(f"metadata_schema.{field} is required in the active domain config")
+    values = DOMAIN.metadata_schema[field]
     if not isinstance(values, (list, tuple)) or not values:
         raise ValueError(f"metadata_schema.{field} must be a non-empty list")
     result = []
@@ -177,26 +109,12 @@ def schema_list(field: str, default_values) -> list[str]:
     return result
 
 
-DEFAULT_METADATA_FIELD_MAP = {
-    "document_primary_role": "document_primary_role",
-    "document_roles": "document_roles",
-    "document_facets": "document_content_facets",
-    "document_layers": "document_system_layers",
-    "document_stages": "document_workflow_stages",
-    "document_criticality": "document_safety_relevance",
-    "document_delivery_value": "document_delivery_value",
-    "document_decision": "document_corpus_decision",
-    "document_confidence": "document_confidence",
-    "document_signal_chunks": "document_signal_chunks",
-}
+def metadata_field(logical_name: str) -> str:
+    """Return the payload field name for a logical metadata concept.
 
-
-def metadata_field(logical_name: str, default: str | None = None) -> str:
-    """Return configured payload field for a logical metadata concept.
-
-    DOMAIN.metadata_fields.<logical>.payload is the source of truth for
-    chunk-level fields. DOMAIN.metadata_field_map is kept for document-level
-    aliases.
+    Chunk-level logical fields come from DOMAIN.metadata_fields.<logical>.payload.
+    Document-level aliases come from DOMAIN.metadata_field_map. Missing config is
+    a hard error so domain policy never falls back to code-level defaults.
     """
     configured = getattr(DOMAIN, "metadata_fields", {}) or {}
     field_cfg = configured.get(logical_name) if isinstance(configured.get(logical_name), dict) else {}
@@ -204,11 +122,13 @@ def metadata_field(logical_name: str, default: str | None = None) -> str:
     if isinstance(payload, str) and payload.strip():
         return payload.strip()
 
-    field_map = dict(DEFAULT_METADATA_FIELD_MAP)
-    field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
-    fallback = default if default is not None else logical_name
-    value = field_map.get(logical_name, fallback)
-    return str(value or fallback)
+    field_map = getattr(DOMAIN, "metadata_field_map", {}) or {}
+    value = field_map.get(logical_name)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    raise ValueError(f"No payload mapping for logical metadata field {logical_name!r} in active domain config")
+
 
 LOGICAL_METADATA_ORDER = (
     "role",
@@ -220,84 +140,33 @@ LOGICAL_METADATA_ORDER = (
     "decision",
 )
 
-DEFAULT_METADATA_FIELDS = {
-    "role": {
-        "payload": "chunk_role",
-        "prompt_label": "chunk_role",
-        "schema_key": "chunk_role",
-        "kind": "enum",
-        "default": "unknown",
-    },
-    "facets": {
-        "payload": "content_facets",
-        "prompt_label": "content_facets",
-        "schema_key": "content_facets",
-        "kind": "list_enum",
-        "default": ["unknown"],
-    },
-    "layers": {
-        "payload": "system_layers",
-        "prompt_label": "system_layers",
-        "schema_key": "system_layers",
-        "kind": "list_enum",
-        "default": ["unknown"],
-    },
-    "stages": {
-        "payload": "workflow_stages",
-        "prompt_label": "workflow_stages",
-        "schema_key": "workflow_stages",
-        "kind": "list_enum",
-        "default": ["unknown"],
-    },
-    "criticality": {
-        "payload": "safety_relevance",
-        "prompt_label": "safety_relevance",
-        "schema_key": "safety_relevance",
-        "kind": "enum",
-        "default": "unknown",
-    },
-    "delivery_value": {
-        "payload": "delivery_value",
-        "prompt_label": "delivery_value",
-        "schema_key": "delivery_value",
-        "kind": "enum",
-        "default": "low",
-    },
-    "decision": {
-        "payload": "corpus_decision",
-        "prompt_label": "corpus_decision",
-        "schema_key": "corpus_decision",
-        "kind": "enum",
-        "default": "secondary",
-    },
-}
-
 
 def metadata_fields_config() -> dict:
     configured = getattr(DOMAIN, "metadata_fields", {}) or {}
     merged = {}
-    for logical_name, default_cfg in DEFAULT_METADATA_FIELDS.items():
-        configured_cfg = configured.get(logical_name) if isinstance(configured.get(logical_name), dict) else {}
-        cfg = dict(default_cfg)
-        cfg.update(configured_cfg)
-
-        # metadata_fields.<logical>.payload is the source of truth for chunk-level fields.
-        cfg["payload"] = str(cfg.get("payload") or metadata_field(logical_name, default_cfg["payload"]))
-        cfg["prompt_label"] = str(cfg.get("prompt_label") or cfg["payload"] or logical_name)
-
-        # Important: if a domain pack supplies values_ref but omits schema_key,
-        # values_ref must win over the ADAS/default schema_key. Otherwise a new
-        # domain can silently validate against the wrong enum.
-        if configured_cfg.get("schema_key"):
-            schema_key = configured_cfg["schema_key"]
-        elif configured_cfg.get("values_ref"):
-            schema_key = str(configured_cfg["values_ref"]).split(".")[-1]
-        else:
-            schema_key = cfg.get("schema_key") or cfg.get("values_ref", "").split(".")[-1] or cfg["prompt_label"]
-        cfg["schema_key"] = str(schema_key)
-
-        cfg["kind"] = str(cfg.get("kind") or default_cfg["kind"])
-        merged[logical_name] = cfg
+    for logical_name in LOGICAL_METADATA_ORDER:
+        cfg = configured.get(logical_name)
+        if not isinstance(cfg, dict):
+            raise ValueError(f"metadata_fields.{logical_name} must be defined in the active domain config")
+        payload = str(cfg.get("payload") or "").strip()
+        prompt_label = str(cfg.get("prompt_label") or "").strip()
+        if not payload:
+            raise ValueError(f"metadata_fields.{logical_name}.payload is required")
+        if not prompt_label:
+            raise ValueError(f"metadata_fields.{logical_name}.prompt_label is required")
+        out = dict(cfg)
+        out["payload"] = payload
+        out["prompt_label"] = prompt_label
+        if not out.get("schema_key"):
+            values_ref = str(out.get("values_ref") or "")
+            if values_ref.startswith("metadata_schema."):
+                out["schema_key"] = values_ref.split(".", 1)[1]
+            elif "." in values_ref:
+                out["schema_key"] = values_ref.rsplit(".", 1)[-1]
+            else:
+                out["schema_key"] = prompt_label
+        out["kind"] = str(out.get("kind") or "enum")
+        merged[logical_name] = out
     return merged
 
 
@@ -323,16 +192,7 @@ def metadata_kind(logical_name: str) -> str:
 
 def metadata_allowed_values(logical_name: str) -> set[str]:
     schema_key = metadata_schema_key(logical_name)
-    default_by_logical = {
-        "role": DEFAULT_CHUNK_ROLE_VALUES,
-        "facets": DEFAULT_CONTENT_FACET_VALUES,
-        "layers": DEFAULT_SYSTEM_LAYER_VALUES,
-        "stages": DEFAULT_WORKFLOW_STAGE_VALUES,
-        "criticality": DEFAULT_SAFETY_RELEVANCE_VALUES,
-        "delivery_value": DEFAULT_DELIVERY_VALUE_VALUES,
-        "decision": DEFAULT_CORPUS_DECISION_VALUES,
-    }
-    return schema_values(schema_key, default_by_logical[logical_name])
+    return schema_values(schema_key)
 
 
 def metadata_raw_value(raw: dict, logical_name: str):
@@ -340,66 +200,62 @@ def metadata_raw_value(raw: dict, logical_name: str):
     candidate_keys = [
         cfg.get("prompt_label"),
         cfg.get("payload"),
-        metadata_field(logical_name),
         logical_name,
     ]
-    # Backward compatible aliases for old ADAS payloads.
-    candidate_keys.extend([
-        DEFAULT_METADATA_FIELDS[logical_name]["prompt_label"],
-        DEFAULT_METADATA_FIELDS[logical_name]["payload"],
-    ])
     for key in candidate_keys:
         if key and key in raw:
             return raw.get(key)
     return None
 
 
-ROLE_FIELD = metadata_field("role", "chunk_role")
-FACETS_FIELD = metadata_field("facets", "content_facets")
-LAYERS_FIELD = metadata_field("layers", "system_layers")
-STAGES_FIELD = metadata_field("stages", "workflow_stages")
-CRITICALITY_FIELD = metadata_field("criticality", "safety_relevance")
-DELIVERY_FIELD = metadata_field("delivery_value", "delivery_value")
-DECISION_FIELD = metadata_field("decision", "corpus_decision")
+ROLE_FIELD = metadata_field("role")
+FACETS_FIELD = metadata_field("facets")
+LAYERS_FIELD = metadata_field("layers")
+STAGES_FIELD = metadata_field("stages")
+CRITICALITY_FIELD = metadata_field("criticality")
+DELIVERY_FIELD = metadata_field("delivery_value")
+DECISION_FIELD = metadata_field("decision")
 
-DOC_PRIMARY_ROLE_FIELD = metadata_field("document_primary_role", "document_primary_role")
-DOC_ROLES_FIELD = metadata_field("document_roles", "document_roles")
-DOC_FACETS_FIELD = metadata_field("document_facets", "document_content_facets")
-DOC_LAYERS_FIELD = metadata_field("document_layers", "document_system_layers")
-DOC_STAGES_FIELD = metadata_field("document_stages", "document_workflow_stages")
-DOC_CRITICALITY_FIELD = metadata_field("document_criticality", "document_safety_relevance")
-DOC_DELIVERY_FIELD = metadata_field("document_delivery_value", "document_delivery_value")
-DOC_DECISION_FIELD = metadata_field("document_decision", "document_corpus_decision")
-DOC_CONFIDENCE_FIELD = metadata_field("document_confidence", "document_confidence")
-DOC_SIGNAL_CHUNKS_FIELD = metadata_field("document_signal_chunks", "document_signal_chunks")
+DOC_PRIMARY_ROLE_FIELD = metadata_field("document_primary_role")
+DOC_ROLES_FIELD = metadata_field("document_roles")
+DOC_FACETS_FIELD = metadata_field("document_facets")
+DOC_LAYERS_FIELD = metadata_field("document_layers")
+DOC_STAGES_FIELD = metadata_field("document_stages")
+DOC_CRITICALITY_FIELD = metadata_field("document_criticality")
+DOC_DELIVERY_FIELD = metadata_field("document_delivery_value")
+DOC_DECISION_FIELD = metadata_field("document_decision")
+DOC_CONFIDENCE_FIELD = metadata_field("document_confidence")
+DOC_SIGNAL_CHUNKS_FIELD = metadata_field("document_signal_chunks")
 
 
 def document_aggregation_config() -> dict:
     return dict(getattr(DOMAIN, "document_aggregation", {}) or {})
 
 
-def aggregation_rank_map(name: str, default: dict[str, int]) -> dict[str, int]:
-    raw = document_aggregation_config().get(name, default)
-    if not isinstance(raw, dict):
-        return dict(default)
+def aggregation_rank_map(name: str) -> dict[str, int]:
+    raw = document_aggregation_config().get(name)
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"document_aggregation.{name} must be a non-empty object")
     out = {}
     for key, value in raw.items():
-        try:
-            out[str(key)] = int(value)
-        except Exception:
-            continue
-    return out or dict(default)
+        out[str(key)] = int(value)
+    return out
 
 
-def aggregation_list(path: tuple[str, ...], default: list[str]) -> list[str]:
+def aggregation_required(path: tuple[str, ...]):
     cfg = document_aggregation_config()
     value = cfg
     for part in path:
-        if not isinstance(value, dict):
-            return list(default)
-        value = value.get(part)
+        if not isinstance(value, dict) or part not in value:
+            raise ValueError("document_aggregation." + ".".join(path) + " is required")
+        value = value[part]
+    return value
+
+
+def aggregation_list(path: tuple[str, ...]) -> list[str]:
+    value = aggregation_required(path)
     if not isinstance(value, list):
-        return list(default)
+        raise ValueError("document_aggregation." + ".".join(path) + " must be a list")
     return [str(x) for x in value]
 
 
@@ -420,7 +276,7 @@ WORKFLOW_STAGE_VALUES = metadata_allowed_values("stages")
 SAFETY_RELEVANCE_VALUES = metadata_allowed_values("criticality")
 DELIVERY_VALUE_VALUES = metadata_allowed_values("delivery_value")
 CORPUS_DECISION_VALUES = metadata_allowed_values("decision")
-BOOLEAN_FLAG_FIELDS = tuple(schema_list("boolean_flags", DEFAULT_BOOLEAN_FLAG_FIELDS))
+BOOLEAN_FLAG_FIELDS = tuple(schema_list("boolean_flags"))
 
 METADATA_ALLOWED_VALUES = {
     "role": CHUNK_ROLE_VALUES,
@@ -432,8 +288,9 @@ METADATA_ALLOWED_VALUES = {
     "decision": CORPUS_DECISION_VALUES,
 }
 
-SAFETY_RANK = aggregation_rank_map("criticality_rank", {"unknown": 0, "low": 1, "medium": 2, "high": 3})
-DELIVERY_RANK = aggregation_rank_map("delivery_rank", {"low": 0, "medium": 1, "high": 2})
+SAFETY_RANK = aggregation_rank_map("criticality_rank")
+DELIVERY_RANK = aggregation_rank_map("delivery_rank")
+DECISION_DROP_VALUES = set(aggregation_list(("decision", "drop_values")))
 
 
 STATS = {
@@ -941,69 +798,18 @@ def item_to_metadata(item):
 # =============================================================================
 
 
-DEFAULT_METADATA_EXTRACTION = {
-    "system_rules": [
-        "You are a strict metadata extractor for a technical RAG corpus.",
-        "Return JSON only.",
-        "Do not explain.",
-        "Do not include markdown.",
-        "Use only the provided chunk texts.",
-        "Use chunk_index only as an identifier, never as evidence.",
-        "Do not infer missing context from surrounding chunks.",
-        "Use exact enum values only.",
-        "Classify each chunk independently.",
-        "Do not create metadata for chunks that are not explicitly listed.",
-        "Return exactly one compact row for every expected chunk_index.",
-        "If unsure, use \"unknown\" where allowed.",
-    ],
-    "objective": (
-        "Classify each chunk independently for a Domain Delivery RAG focused on "
-        "engineering delivery for safety-relevant technical systems."
-    ),
-    "field_definitions": {
-        "chunk_role": "the primary role of this chunk.",
-        "content_facets": "what kind of useful content appears here. Multiple values are allowed.",
-        "system_layers": "which system layer this chunk concerns. Multiple values are allowed.",
-        "workflow_stages": "where this chunk helps in delivery lifecycle. Multiple values are allowed.",
-        "safety_relevance": (
-            "high only if this chunk directly affects safety behavior, safety assurance, "
-            "compliance, validation, failure/degraded modes, or safety-critical deployment."
-        ),
-        "delivery_value": (
-            "high only if this chunk helps implementation, verification, release, debugging, "
-            "integration, or decision-making."
-        ),
-        "corpus_decision": (
-            "primary if this chunk should be indexed for v1 delivery RAG; secondary if useful "
-            "but not core; drop if mostly noise."
-        ),
-        "boolean_flags": "true only when the chunk explicitly contains that type of evidence.",
-    },
-    "return_instruction": "Return compact JSON only.",
-}
-
-
 def metadata_extraction_config() -> dict:
-    config = dict(DEFAULT_METADATA_EXTRACTION)
-    domain_config = getattr(DOMAIN, "metadata_extraction", {}) or {}
-
-    if isinstance(domain_config.get("system_rules"), list) and domain_config["system_rules"]:
-        config["system_rules"] = [str(x) for x in domain_config["system_rules"] if str(x).strip()]
-
-    if isinstance(domain_config.get("objective"), str) and domain_config["objective"].strip():
-        config["objective"] = domain_config["objective"].strip()
-
-    field_definitions = dict(DEFAULT_METADATA_EXTRACTION["field_definitions"])
-    if isinstance(domain_config.get("field_definitions"), dict):
-        for key, value in domain_config["field_definitions"].items():
-            if isinstance(value, str) and value.strip():
-                field_definitions[str(key)] = value.strip()
-    config["field_definitions"] = field_definitions
-
-    if isinstance(domain_config.get("return_instruction"), str) and domain_config["return_instruction"].strip():
-        config["return_instruction"] = domain_config["return_instruction"].strip()
-
-    return config
+    config = getattr(DOMAIN, "metadata_extraction", {}) or {}
+    required = ("system_rules", "objective", "field_definitions", "return_instruction")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError("metadata_extraction is missing required keys: " + ", ".join(missing))
+    return {
+        "system_rules": [str(x).strip() for x in config["system_rules"] if str(x).strip()],
+        "objective": str(config["objective"]).strip(),
+        "field_definitions": {str(k): str(v).strip() for k, v in dict(config["field_definitions"]).items()},
+        "return_instruction": str(config["return_instruction"]).strip(),
+    }
 
 
 def render_metadata_system_prompt() -> str:
@@ -1016,16 +822,11 @@ def metadata_definition_for(logical_name: str) -> str:
     definitions = config["field_definitions"]
     prompt_label = metadata_prompt_label(logical_name)
     payload_field = metadata_payload_field(logical_name)
-    return str(
-        # Prefer logical definitions from the domain pack. This lets configs stay
-        # domain-neutral even when ADAS-compatible prompt labels/payload names
-        # are also present as legacy defaults.
-        definitions.get(logical_name)
-        or definitions.get(prompt_label)
-        or definitions.get(payload_field)
-        or DEFAULT_METADATA_EXTRACTION["field_definitions"].get(DEFAULT_METADATA_FIELDS[logical_name]["prompt_label"])
-        or f"metadata field {prompt_label}."
-    )
+    for key in (logical_name, prompt_label, payload_field):
+        value = definitions.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise ValueError(f"metadata_extraction.field_definitions is missing {logical_name!r} / {prompt_label!r}")
 
 
 def metadata_allowed_lines() -> str:
@@ -1043,8 +844,10 @@ def metadata_definition_lines() -> str:
     for logical_name in LOGICAL_METADATA_ORDER:
         lines.append(f"- {metadata_prompt_label(logical_name)}: {metadata_definition_for(logical_name)}")
     definitions = metadata_extraction_config()["field_definitions"]
-    flag_definition = definitions.get("boolean_flags") or DEFAULT_METADATA_EXTRACTION["field_definitions"]["boolean_flags"]
-    lines.append(f"- boolean flags: {flag_definition}")
+    flag_definition = definitions.get("boolean_flags")
+    if not isinstance(flag_definition, str) or not flag_definition.strip():
+        raise ValueError("metadata_extraction.field_definitions.boolean_flags is required")
+    lines.append(f"- boolean flags: {flag_definition.strip()}")
     return "\n".join(lines)
 
 
@@ -1064,15 +867,11 @@ def compact_example_value(logical_name: str):
     if metadata_kind(logical_name) == "list_enum":
         if isinstance(cfg_default, list) and cfg_default:
             return cfg_default
-        for preferred in ("validation", "perception", "verification", "implementation", "unknown"):
-            if preferred in allowed:
-                return [preferred]
+        if isinstance(cfg_default, str) and cfg_default in allowed:
+            return [cfg_default]
         return [allowed[0]]
     if isinstance(cfg_default, str) and cfg_default in allowed:
         return cfg_default
-    for preferred in ("test", "high", "primary", "unknown", "secondary", "low"):
-        if preferred in allowed:
-            return preferred
     return allowed[0]
 
 
@@ -1373,24 +1172,33 @@ def max_enum(chunk_metas, field: str, rank_map: dict, default: str):
 
 
 def aggregate_document_metadata(chunk_metas):
-    signal_cfg = (document_aggregation_config().get("signal") or {})
-    decision_cfg = (document_aggregation_config().get("decision") or {})
-    limits = document_aggregation_config().get("weighted_top_limits") or {}
-    ignore_values = set(document_aggregation_config().get("ignore_values") or ["unknown", "noise"])
+    signal_cfg = aggregation_required(("signal",))
+    decision_cfg = aggregation_required(("decision",))
+    limits = aggregation_required(("weighted_top_limits",))
+    ignore_values = set(aggregation_list(("ignore_values",)))
 
-    primary_decisions = set(str(x) for x in decision_cfg.get("primary_values", ["primary"]))
-    drop_decisions = set(str(x) for x in decision_cfg.get("drop_values", ["drop"]))
-    default_decision = str(decision_cfg.get("default", "secondary"))
+    primary_decisions = set(str(x) for x in aggregation_list(("decision", "primary_values")))
+    drop_decisions = set(str(x) for x in aggregation_list(("decision", "drop_values")))
+    default_decision = str(aggregation_required(("decision", "default")))
+    role_default = str(metadata_field_config("role").get("default"))
+    facets_default = metadata_field_config("facets").get("default")
+    layers_default = metadata_field_config("layers").get("default")
+    stages_default = metadata_field_config("stages").get("default")
+    criticality_default = str(metadata_field_config("criticality").get("default"))
+    delivery_default = str(metadata_field_config("delivery_value").get("default"))
+    facets_default = facets_default if isinstance(facets_default, list) else [str(facets_default)]
+    layers_default = layers_default if isinstance(layers_default, list) else [str(layers_default)]
+    stages_default = stages_default if isinstance(stages_default, list) else [str(stages_default)]
 
     if not chunk_metas:
         return {
-            DOC_PRIMARY_ROLE_FIELD: "unknown",
-            DOC_ROLES_FIELD: ["unknown"],
-            DOC_FACETS_FIELD: ["unknown"],
-            DOC_LAYERS_FIELD: ["unknown"],
-            DOC_STAGES_FIELD: ["unknown"],
-            DOC_CRITICALITY_FIELD: "unknown",
-            DOC_DELIVERY_FIELD: "low",
+            DOC_PRIMARY_ROLE_FIELD: role_default,
+            DOC_ROLES_FIELD: [role_default],
+            DOC_FACETS_FIELD: facets_default,
+            DOC_LAYERS_FIELD: layers_default,
+            DOC_STAGES_FIELD: stages_default,
+            DOC_CRITICALITY_FIELD: criticality_default,
+            DOC_DELIVERY_FIELD: delivery_default,
             DOC_DECISION_FIELD: default_decision,
             DOC_CONFIDENCE_FIELD: 0.0,
             DOC_SIGNAL_CHUNKS_FIELD: [],
@@ -1399,48 +1207,48 @@ def aggregate_document_metadata(chunk_metas):
     roles = weighted_top_values(
         chunk_metas,
         ROLE_FIELD,
-        limit=int(limits.get("roles", 6)),
+        limit=int(limits["roles"]),
         ignore_values=ignore_values,
     )
     facets = weighted_top_values(
         chunk_metas,
         FACETS_FIELD,
-        limit=int(limits.get("facets", 10)),
-        ignore_values={"unknown"},
+        limit=int(limits["facets"]),
+        ignore_values=ignore_values,
     )
     layers = weighted_top_values(
         chunk_metas,
         LAYERS_FIELD,
-        limit=int(limits.get("layers", 10)),
-        ignore_values={"unknown"},
+        limit=int(limits["layers"]),
+        ignore_values=ignore_values,
     )
     stages = weighted_top_values(
         chunk_metas,
         STAGES_FIELD,
-        limit=int(limits.get("stages", 8)),
-        ignore_values={"unknown"},
+        limit=int(limits["stages"]),
+        ignore_values=ignore_values,
     )
 
-    document_primary_role = roles[0] if roles else "unknown"
-    document_criticality = max_enum(chunk_metas, CRITICALITY_FIELD, SAFETY_RANK, "unknown")
-    document_delivery_value = max_enum(chunk_metas, DELIVERY_FIELD, DELIVERY_RANK, "low")
+    document_primary_role = roles[0] if roles else role_default
+    document_criticality = max_enum(chunk_metas, CRITICALITY_FIELD, SAFETY_RANK, criticality_default)
+    document_delivery_value = max_enum(chunk_metas, DELIVERY_FIELD, DELIVERY_RANK, delivery_default)
 
     decisions = [m.get(DECISION_FIELD) for m in chunk_metas]
     if any(d in primary_decisions for d in decisions):
-        document_decision = "primary" if "primary" in primary_decisions else sorted(primary_decisions)[0]
+        document_decision = next(d for d in decisions if d in primary_decisions)
     elif decisions and all(d in drop_decisions for d in decisions):
-        document_decision = "drop" if "drop" in drop_decisions else sorted(drop_decisions)[0]
+        document_decision = next(d for d in decisions if d in drop_decisions)
     else:
         document_decision = default_decision
 
     avg_confidence = sum(m.get("confidence", 0.0) for m in chunk_metas) / len(chunk_metas)
 
-    signal_decisions = set(str(x) for x in signal_cfg.get("decision_values", ["primary"]))
-    signal_delivery_values = set(str(x) for x in signal_cfg.get("delivery_values", ["high"]))
-    signal_criticality_values = set(str(x) for x in signal_cfg.get("criticality_values", ["high"]))
-    signal_roles = set(str(x) for x in signal_cfg.get("roles", []))
-    signal_flags = [str(x) for x in signal_cfg.get("flags", [])]
-    max_signal_chunks = int(signal_cfg.get("max_signal_chunks", 20))
+    signal_decisions = set(str(x) for x in aggregation_list(("signal", "decision_values")))
+    signal_delivery_values = set(str(x) for x in aggregation_list(("signal", "delivery_values")))
+    signal_criticality_values = set(str(x) for x in aggregation_list(("signal", "criticality_values")))
+    signal_roles = set(str(x) for x in aggregation_list(("signal", "roles")))
+    signal_flags = [str(x) for x in aggregation_list(("signal", "flags"))]
+    max_signal_chunks = int(aggregation_required(("signal", "max_signal_chunks")))
 
     signal_chunks = []
     for i, meta in enumerate(chunk_metas):
@@ -1456,10 +1264,10 @@ def aggregate_document_metadata(chunk_metas):
 
     return {
         DOC_PRIMARY_ROLE_FIELD: document_primary_role,
-        DOC_ROLES_FIELD: roles or ["unknown"],
-        DOC_FACETS_FIELD: facets or ["unknown"],
-        DOC_LAYERS_FIELD: layers or ["unknown"],
-        DOC_STAGES_FIELD: stages or ["unknown"],
+        DOC_ROLES_FIELD: roles or [role_default],
+        DOC_FACETS_FIELD: facets or facets_default,
+        DOC_LAYERS_FIELD: layers or layers_default,
+        DOC_STAGES_FIELD: stages or stages_default,
         DOC_CRITICALITY_FIELD: document_criticality,
         DOC_DELIVERY_FIELD: document_delivery_value,
         DOC_DECISION_FIELD: document_decision,
@@ -1645,7 +1453,7 @@ def main():
         for i, chunk in enumerate(chunks):
             chunk_meta = chunk_metas[i]
 
-            if chunk_meta.get(DECISION_FIELD) == "drop" and not INDEX_DROPPED_CHUNKS:
+            if chunk_meta.get(DECISION_FIELD) in DECISION_DROP_VALUES and not INDEX_DROPPED_CHUNKS:
                 skipped_drop += 1
                 continue
 

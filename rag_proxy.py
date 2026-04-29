@@ -17,7 +17,7 @@ Architecture:
 
 User command:
   /rag 5
-  What are the likely warning-related and safety-relevant implications ...
+  What are the risks, owners, metrics, and next delivery steps ...
 
 Behavior:
   - proxy all HTTP paths/methods to llama-server

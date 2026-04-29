@@ -70,7 +70,7 @@ DEFAULT_EVAL_FILE = Path(os.environ.get("RAG_EVAL_FILE", rc.DOMAIN.eval_file)).e
 RUNS_DIR = Path(
     os.environ.get(
         "RAG_EVAL_RUNS_DIR",
-        os.environ.get("RAG_EVAL_RUN_DIR", getattr(rc.DOMAIN, "eval_run_dir", str(BASE_DIR / "eval_runs"))),
+        os.environ.get("RAG_EVAL_RUN_DIR", rc.DOMAIN.eval_run_dir),
     )
 ).expanduser()
 
@@ -78,7 +78,7 @@ CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/complet
 
 ANSWER_MAX_TOKENS = int(os.environ.get("RAG_ANSWER_EVAL_MAX_TOKENS", "16384"))
 ANSWER_TIMEOUT = int(os.environ.get("RAG_ANSWER_EVAL_TIMEOUT", "1800"))
-DEFAULT_TOP_K = int(os.environ.get("RAG_ANSWER_EVAL_TOP_K", "5"))
+DEFAULT_TOP_K = int(os.environ.get("RAG_ANSWER_EVAL_TOP_K", str(rc.DEFAULT_TOP_K)))
 
 MIN_ANSWER_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CHARS", "600"))
 MIN_CITATION_COUNT = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CITATIONS", "2"))
@@ -247,8 +247,7 @@ def call_chat(prompt: str):
 #   1. Conclusion
 #   1. **Conclusion**
 #   ### 1. Conclusion
-# Section titles are now derived from the active domain answer contract instead
-# of being hardcoded to the ADAS/current six-section layout.
+# Section titles are derived from the active domain answer contract.
 def _section_key(title: str) -> str:
     key = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
     return key or "section"
@@ -335,21 +334,7 @@ INSUFFICIENT_EVIDENCE_PATTERNS = [
 ]
 
 CLASSIFICATION_METADATA_LEAK_PATTERNS = [
-    r"\bchunk_role\b",
-    r"\bcontent_facets\b",
-    r"\bsystem_layers\b",
-    r"\bworkflow_stages\b",
     r"\breason_short\b",
-    r"\bcorpus_decision\b",
-    r"\bdocument_primary_role\b",
-    r"\bdocument_content_facets\b",
-    r"\bdocument_system_layers\b",
-    r"\bdocument_signal_chunks\b",
-    r"\bhas_behavioral_requirements\b",
-    r"\bhas_interface_or_contract\b",
-    r"\bhas_validation_or_test_evidence\b",
-    r"\bhas_failure_or_degraded_mode\b",
-    r"\bhas_regulatory_or_compliance\b",
 ]
 
 

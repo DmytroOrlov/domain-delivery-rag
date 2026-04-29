@@ -27,9 +27,10 @@ Important semantics:
 - The LLM context contains only source provenance (source id, sanitized file
   name, chunk indices) plus chunk text. Full local file paths are deliberately
   excluded from the answer prompt.
-- corpus_decision="drop" means the ingest pipeline should exclude the chunk from
-  the Qdrant collection by default. Any retrieved drop chunk is treated as a
-  configuration/indexing problem and receives a negative metadata prior.
+- The active domain's configured drop decision means the ingest pipeline should
+  exclude the chunk from the Qdrant collection by default. Any retrieved drop
+  chunk is treated as a configuration/indexing problem and receives the domain's
+  configured metadata prior.
 
 Used by:
 - rag_proxy.py        browser /rag UX through stock llama.cpp UI
@@ -62,14 +63,20 @@ EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings
 QDRANT_URL = os.environ.get("RAG_QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = os.environ.get("RAG_COLLECTION", DOMAIN.collection)
 
-DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", str(DOMAIN.retrieval_defaults.get("top_k", 5))))
-DEFAULT_PRE_K = int(os.environ.get("RAG_PRE_K", str(DOMAIN.retrieval_defaults.get("pre_k", 24))))
-DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(DOMAIN.retrieval_defaults.get("max_per_file", 2))))
-DEFAULT_NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", str(DOMAIN.retrieval_defaults.get("neighbor_radius", 1))))
+def _required_config_value(mapping: dict[str, Any], key: str, context: str) -> Any:
+    if key not in mapping:
+        raise ValueError(f"{context}.{key} is required in the active domain config")
+    return mapping[key]
 
-SELECTED_MAX_CHARS = int(os.environ.get("RAG_SELECTED_MAX_CHARS", str(DOMAIN.context_defaults.get("selected_max_chars", 2200))))
-NEIGHBOR_SNIPPET_CHARS = int(os.environ.get("RAG_NEIGHBOR_SNIPPET_CHARS", str(DOMAIN.context_defaults.get("neighbor_snippet_chars", 700))))
-CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(DOMAIN.context_defaults.get("context_max_chars", 18000))))
+
+DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", str(_required_config_value(DOMAIN.retrieval_defaults, "top_k", "retrieval_defaults"))))
+DEFAULT_PRE_K = int(os.environ.get("RAG_PRE_K", str(_required_config_value(DOMAIN.retrieval_defaults, "pre_k", "retrieval_defaults"))))
+DEFAULT_MAX_PER_FILE = int(os.environ.get("RAG_MAX_PER_FILE", str(_required_config_value(DOMAIN.retrieval_defaults, "max_per_file", "retrieval_defaults"))))
+DEFAULT_NEIGHBOR_RADIUS = int(os.environ.get("RAG_NEIGHBOR_RADIUS", str(_required_config_value(DOMAIN.retrieval_defaults, "neighbor_radius", "retrieval_defaults"))))
+
+SELECTED_MAX_CHARS = int(os.environ.get("RAG_SELECTED_MAX_CHARS", str(_required_config_value(DOMAIN.context_defaults, "selected_max_chars", "context_defaults"))))
+NEIGHBOR_SNIPPET_CHARS = int(os.environ.get("RAG_NEIGHBOR_SNIPPET_CHARS", str(_required_config_value(DOMAIN.context_defaults, "neighbor_snippet_chars", "context_defaults"))))
+CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(_required_config_value(DOMAIN.context_defaults, "context_max_chars", "context_defaults"))))
 
 # Bounded metadata rerank. This is a heuristic, not a learned ranker.
 # It can reorder close dense candidates; this is intentional but must remain
@@ -79,8 +86,8 @@ CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(DOMAIN.conte
 # RAG_METADATA_PRIOR=0 disables the heuristic globally for normal callers.
 # Ablation code can also override it per call through retrieve_dense(...,
 # use_metadata_prior=False).
-RERANK_CONFIG = getattr(DOMAIN, "rerank", {}) or {}
-RERANK_CLAMP = RERANK_CONFIG.get("clamp", [-0.045, 0.050])
+RERANK_CONFIG = dict(getattr(DOMAIN, "rerank", {}) or {})
+RERANK_CLAMP = _required_config_value(RERANK_CONFIG, "clamp", "rerank")
 META_MIN = float(os.environ.get("RAG_META_MIN", str(RERANK_CLAMP[0])))
 META_MAX = float(os.environ.get("RAG_META_MAX", str(RERANK_CLAMP[1])))
 METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
@@ -88,19 +95,15 @@ METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
 
-DEFAULT_METADATA_FIELD_MAP: dict[str, str] = {}
-
-
 def metadata_fields_config() -> dict[str, Any]:
     return dict(getattr(DOMAIN, "metadata_fields", {}) or {})
 
 
-def metadata_field(logical_name: str, default: str | None = None) -> str:
+def metadata_field(logical_name: str) -> str:
     """Return the payload field name for a logical metadata concept.
 
-    Chunk-level logical fields are defined by DOMAIN.metadata_fields and its
-    per-field ``payload`` value. DOMAIN.metadata_field_map is reserved for
-    document-level aliases.
+    Chunk-level logical fields are defined by DOMAIN.metadata_fields. Document-level
+    aliases are defined by DOMAIN.metadata_field_map. Missing entries fail fast.
     """
     fields = metadata_fields_config()
     field_cfg = fields.get(logical_name) if isinstance(fields.get(logical_name), dict) else {}
@@ -108,116 +111,83 @@ def metadata_field(logical_name: str, default: str | None = None) -> str:
     if isinstance(payload, str) and payload.strip():
         return payload.strip()
 
-    field_map = dict(DEFAULT_METADATA_FIELD_MAP)
-    field_map.update(getattr(DOMAIN, "metadata_field_map", {}) or {})
-    fallback = default if default is not None else logical_name
-    value = field_map.get(logical_name, fallback)
-    return str(value or fallback)
+    field_map = getattr(DOMAIN, "metadata_field_map", {}) or {}
+    value = field_map.get(logical_name)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    raise ValueError(f"No payload mapping for logical metadata field {logical_name!r} in active domain config")
 
 
 def boolean_flag_fields() -> list[str]:
     schema = getattr(DOMAIN, "metadata_schema", {}) or {}
-    flags = schema.get("boolean_flags") or []
+    flags = _required_config_value(schema, "boolean_flags", "metadata_schema")
     return [str(flag) for flag in flags]
 
 
-def payload_metadata(payload: dict[str, Any], logical_name: str, default_field: str | None = None, default: Any = None) -> Any:
-    return payload.get(metadata_field(logical_name, default_field), default)
+def payload_metadata(payload: dict[str, Any], logical_name: str, default: Any = None) -> Any:
+    return payload.get(metadata_field(logical_name), default)
 
 
 def payload_decision(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "decision", "corpus_decision")
+    return payload_metadata(payload, "decision")
 
 
 def payload_delivery_value(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "delivery_value", "delivery_value")
+    return payload_metadata(payload, "delivery_value")
 
 
 def payload_criticality(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "criticality", "safety_relevance")
+    return payload_metadata(payload, "criticality")
 
 
 def payload_role(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "role", "chunk_role")
+    return payload_metadata(payload, "role")
 
 
 def payload_facets(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "facets", "content_facets")
+    return payload_metadata(payload, "facets")
 
 
 def payload_layers(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "layers", "system_layers")
+    return payload_metadata(payload, "layers")
 
 
 def payload_stages(payload: dict[str, Any]) -> Any:
-    return payload_metadata(payload, "stages", "workflow_stages")
-
-
-DEFAULT_ANSWER_GROUNDING_RULES = [
-    "Use the retrieved context first.",
-    "The retrieved chunk text is the source of truth.",
-    "Use source ids, file names, and chunk ids only for citation/source mapping.",
-    "Separate supported facts from inference.",
-    "If the retrieved context does not support a claim, say so explicitly.",
-    "Be conservative with safety-relevant claims.",
-]
-
-DEFAULT_CITATION_RULE = (
-    "Citation rule: use only exact citations like [S1], [S2]. Do not put chunk ids, "
-    "file names, commas, or extra text inside citation brackets. No [S#] citation "
-    "means no claim. Cite every factual claim, inference, limitation, and "
-    '"not specified" statement.'
-)
-
-DEFAULT_ANSWER_SECTIONS = [
-    "Conclusion",
-    "Supported facts",
-    "Inferences",
-    "Implementation implications",
-    "Unknowns / verification needed",
-    "Source mapping",
-]
-
-DEFAULT_REPAIR_RULES = [
-    "Use the same retrieved context from the original prompt.",
-    "Use exact source citations like [S1], [S2]. Do not put chunk ids, file names, commas, or extra text inside citation brackets.",
-    "No [S#] citation means no claim.",
-    "For missing evidence, cite the retrieved sources reviewed and state what is not specified.",
-    "Do not reproduce malformed tables, orphaned table captions, or repeated list items from context.",
-    "Do not repeat the same phrase or bullet.",
-    "Keep the answer concise.",
-]
+    return payload_metadata(payload, "stages")
 
 
 def answer_config() -> dict[str, Any]:
     return dict(getattr(DOMAIN, "answer", {}) or {})
 
 
-def answer_persona() -> str:
+def _required_answer_value(key: str) -> Any:
     cfg = answer_config()
-    return str(cfg.get("persona") or "You are a senior domain delivery assistant.")
+    if key not in cfg:
+        raise ValueError(f"answer.{key} is required in the active domain config")
+    return cfg[key]
+
+
+def answer_persona() -> str:
+    return str(_required_answer_value("persona"))
 
 
 def answer_grounding_rules() -> list[str]:
-    cfg = answer_config()
-    rules = cfg.get("grounding_rules") or DEFAULT_ANSWER_GROUNDING_RULES
+    rules = _required_answer_value("grounding_rules")
     return [str(rule) for rule in rules if str(rule).strip()]
 
 
 def answer_citation_rule() -> str:
-    cfg = answer_config()
-    return str(cfg.get("citation_rule") or DEFAULT_CITATION_RULE)
+    return str(_required_answer_value("citation_rule"))
 
 
 def answer_sections() -> list[str]:
-    cfg = answer_config()
-    sections = cfg.get("sections") or DEFAULT_ANSWER_SECTIONS
+    sections = _required_answer_value("sections")
     return [str(section) for section in sections if str(section).strip()]
 
 
 def answer_repair_rules() -> list[str]:
-    cfg = answer_config()
-    rules = cfg.get("repair_rules") or DEFAULT_REPAIR_RULES
+    rules = _required_answer_value("repair_rules")
     return [str(rule) for rule in rules if str(rule).strip()]
 
 
@@ -362,10 +332,9 @@ def _query_profile_rule_matches(query_lower: str, tokens: set[str], rule: dict[s
     """
     Match a domain-configured query-profile rule.
 
-    The ADAS domain pack intentionally preserves the old behavior: a rule hits
-    if any configured trigger appears as a substring in the lower-cased query or
-    as an exact token. That keeps multi-word triggers such as "blind spot" and
-    short technical triggers such as "CAN" working as before.
+    A rule hits if any configured trigger appears as a substring in the
+    lower-cased query or as an exact token. That keeps multi-word triggers and
+    short technical triggers working without embedding domain terms in code.
     """
     triggers = _as_list(rule.get("triggers"))
     if not triggers:
@@ -424,23 +393,21 @@ def _value_weight(weights: dict[str, Any], field: str, value: Any) -> float:
 def _hit_weight(hit_cfg: dict[str, Any], hits: int) -> float:
     if not hits:
         return 0.0
-    per_hit = float(hit_cfg.get("per_hit", 0.0))
-    cap = float(hit_cfg.get("cap", per_hit * hits))
+    per_hit = float(_required_config_value(hit_cfg, "per_hit", "rerank.hit_weights"))
+    cap = float(_required_config_value(hit_cfg, "cap", "rerank.hit_weights"))
     return min(hits * per_hit, cap)
 
 
 def _value_weight_for(
     weights: dict[str, Any],
     logical_name: str,
-    default_field: str,
     payload: dict[str, Any],
 ) -> float:
-    field = metadata_field(logical_name, default_field)
+    field = metadata_field(logical_name)
     value = payload.get(field)
 
-    # Prefer the concrete payload field name so existing ADAS configs preserve
-    # byte-for-byte weight semantics. Allow future domain packs to key weights by
-    # logical concept name as a fallback.
+    # Prefer the concrete payload field name. Domain packs may also key weights by
+    # logical concept name for portability across payload schemas.
     key = field if field in weights else logical_name
     return _value_weight(weights, key, value)
 
@@ -457,16 +424,16 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     """
     bonus = 0.0
     rerank = RERANK_CONFIG
-    base_weights = rerank.get("base_weights", {})
-    hit_weights = rerank.get("hit_weights", {})
+    base_weights = _required_config_value(rerank, "base_weights", "rerank")
+    hit_weights = _required_config_value(rerank, "hit_weights", "rerank")
 
-    bonus += _value_weight_for(base_weights, "decision", "corpus_decision", payload)
-    bonus += _value_weight_for(base_weights, "delivery_value", "delivery_value", payload)
-    bonus += _value_weight_for(base_weights, "criticality", "safety_relevance", payload)
-    bonus += _value_weight_for(base_weights, "role", "chunk_role", payload)
+    bonus += _value_weight_for(base_weights, "decision", payload)
+    bonus += _value_weight_for(base_weights, "delivery_value", payload)
+    bonus += _value_weight_for(base_weights, "criticality", payload)
+    bonus += _value_weight_for(base_weights, "role", payload)
 
     try:
-        confidence_weight = float(rerank.get("confidence_weight", 0.0))
+        confidence_weight = float(_required_config_value(rerank, "confidence_weight", "rerank"))
         bonus += min(float(payload.get("confidence") or 0.0), 1.0) * confidence_weight
     except Exception:
         pass
@@ -478,12 +445,12 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     layer_hits = _intersect_count(payload_layers(payload), profile["layers"])
     stage_hits = _intersect_count(payload_stages(payload), profile["stages"])
 
-    bonus += _hit_weight(hit_weights.get("role", {}), role_hits)
-    bonus += _hit_weight(hit_weights.get("facet", {}), facet_hits)
-    bonus += _hit_weight(hit_weights.get("layer", {}), layer_hits)
-    bonus += _hit_weight(hit_weights.get("stage", {}), stage_hits)
+    bonus += _hit_weight(_required_config_value(hit_weights, "role", "rerank.hit_weights"), role_hits)
+    bonus += _hit_weight(_required_config_value(hit_weights, "facet", "rerank.hit_weights"), facet_hits)
+    bonus += _hit_weight(_required_config_value(hit_weights, "layer", "rerank.hit_weights"), layer_hits)
+    bonus += _hit_weight(_required_config_value(hit_weights, "stage", "rerank.hit_weights"), stage_hits)
 
-    flag_weight = float(hit_weights.get("flag", 0.0))
+    flag_weight = float(_required_config_value(hit_weights, "flag", "rerank.hit_weights"))
     for flag in profile["flags"]:
         if payload.get(flag) is True:
             bonus += flag_weight

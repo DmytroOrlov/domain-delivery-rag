@@ -46,29 +46,55 @@ class DomainConfig:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "DomainConfig":
-        answer = dict(data.get("answer", {}))
-        persona = str(answer.get("persona") or "You are a senior domain delivery assistant.")
-        answer.setdefault("persona", persona)
+        """Build a DomainConfig without synthesizing domain-policy defaults.
+
+        The only implicit selector is DEFAULT_DOMAIN_ID in load_domain_config().
+        Every runtime policy used by ingest/retrieval/answer/eval must be present
+        in the selected JSON domain pack.
+        """
+        required_keys = (
+            "id",
+            "display_name",
+            "collection",
+            "input_dir",
+            "failure_dir",
+            "eval_file",
+            "eval_source_map",
+            "eval_run_dir",
+            "answer",
+            "retrieval_defaults",
+            "context_defaults",
+            "query_profiles",
+            "rerank",
+            "metadata_schema",
+            "metadata_extraction",
+            "metadata_field_map",
+            "metadata_fields",
+            "document_aggregation",
+        )
+        missing = [key for key in required_keys if key not in data]
+        if missing:
+            raise ValueError("domain config is missing required keys: " + ", ".join(missing))
 
         return DomainConfig(
             id=str(data["id"]),
             display_name=str(data["display_name"]),
             collection=str(data["collection"]),
-            input_dir=str(data.get("input_dir", "files")),
-            failure_dir=str(data.get("failure_dir", "metadata_failures")),
-            eval_file=str(data.get("eval_file", "eval_queries.json")),
-            eval_source_map=str(data.get("eval_source_map", "eval_source_map.local.json")),
-            eval_run_dir=str(data.get("eval_run_dir", "eval_runs")),
-            answer=answer,
-            retrieval_defaults=dict(data.get("retrieval_defaults", {})),
-            context_defaults=dict(data.get("context_defaults", {})),
-            query_profiles=list(data.get("query_profiles", [])),
-            rerank=dict(data.get("rerank", {})),
-            metadata_schema=dict(data.get("metadata_schema", {})),
-            metadata_extraction=dict(data.get("metadata_extraction", {})),
-            metadata_field_map={str(k): str(v) for k, v in dict(data.get("metadata_field_map", {})).items()},
-            metadata_fields=dict(data.get("metadata_fields", {})),
-            document_aggregation=dict(data.get("document_aggregation", {})),
+            input_dir=str(data["input_dir"]),
+            failure_dir=str(data["failure_dir"]),
+            eval_file=str(data["eval_file"]),
+            eval_source_map=str(data["eval_source_map"]),
+            eval_run_dir=str(data["eval_run_dir"]),
+            answer=dict(data["answer"]),
+            retrieval_defaults=dict(data["retrieval_defaults"]),
+            context_defaults=dict(data["context_defaults"]),
+            query_profiles=list(data["query_profiles"]),
+            rerank=dict(data["rerank"]),
+            metadata_schema=dict(data["metadata_schema"]),
+            metadata_extraction=dict(data["metadata_extraction"]),
+            metadata_field_map={str(k): str(v) for k, v in dict(data["metadata_field_map"]).items()},
+            metadata_fields=dict(data["metadata_fields"]),
+            document_aggregation=dict(data["document_aggregation"]),
         )
 
 
@@ -185,6 +211,25 @@ def _validate_numeric_mapping(context: str, mapping: Any) -> None:
 
 
 
+def _require_object(mapping: dict[str, Any], context: str, key: str) -> dict[str, Any]:
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"{context}.{key} must be an object")
+    return value
+
+
+def _require_list(mapping: dict[str, Any], context: str, key: str) -> list[Any]:
+    value = mapping.get(key)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{context}.{key} must be a non-empty list")
+    return value
+
+
+def _require_numeric(mapping: dict[str, Any], context: str, key: str) -> None:
+    if not isinstance(mapping.get(key), (int, float)):
+        raise ValueError(f"{context}.{key} must be numeric")
+
+
 
 def _validate_metadata_field_map(config: DomainConfig) -> None:
     """Validate aliases in metadata_field_map.
@@ -227,13 +272,23 @@ def _validate_metadata_extraction(config: DomainConfig) -> None:
     if not isinstance(extraction, dict):
         raise ValueError("metadata_extraction must be an object")
 
-    for key in ("system_rules", "field_definitions"):
-        if key in extraction and not isinstance(extraction[key], (list, dict)):
-            raise ValueError(f"metadata_extraction.{key} must be a list or object")
+    required_keys = ("system_rules", "objective", "field_definitions", "return_instruction")
+    missing_keys = [key for key in required_keys if key not in extraction]
+    if missing_keys:
+        raise ValueError("metadata_extraction is missing required keys: " + ", ".join(missing_keys))
 
-    definitions = extraction.get("field_definitions") or {}
-    if definitions and not isinstance(definitions, dict):
-        raise ValueError("metadata_extraction.field_definitions must be an object")
+    if not isinstance(extraction["system_rules"], list) or not extraction["system_rules"]:
+        raise ValueError("metadata_extraction.system_rules must be a non-empty list")
+    for idx, rule in enumerate(extraction["system_rules"]):
+        if not isinstance(rule, str) or not rule.strip():
+            raise ValueError(f"metadata_extraction.system_rules[{idx}] must be a non-empty string")
+
+    if not isinstance(extraction["objective"], str) or not extraction["objective"].strip():
+        raise ValueError("metadata_extraction.objective must be a non-empty string")
+
+    definitions = extraction["field_definitions"]
+    if not isinstance(definitions, dict) or not definitions:
+        raise ValueError("metadata_extraction.field_definitions must be a non-empty object")
 
     prompt_labels = {
         str((config.metadata_fields.get(logical_name) or {}).get("prompt_label") or "")
@@ -272,9 +327,12 @@ def _validate_metadata_extraction(config: DomainConfig) -> None:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"metadata_extraction.field_definitions.{key} must be a non-empty string")
 
-    return_instruction = extraction.get("return_instruction")
-    if return_instruction is not None and (not isinstance(return_instruction, str) or not return_instruction.strip()):
-        raise ValueError("metadata_extraction.return_instruction must be a non-empty string when provided")
+    if "boolean_flags" in (config.metadata_schema or {}) and "boolean_flags" not in definitions:
+        raise ValueError("metadata_extraction.field_definitions.boolean_flags is required when metadata_schema.boolean_flags is defined")
+
+    return_instruction = extraction["return_instruction"]
+    if not isinstance(return_instruction, str) or not return_instruction.strip():
+        raise ValueError("metadata_extraction.return_instruction must be a non-empty string")
 
 def _validate_answer_contract(config: DomainConfig) -> None:
     answer = config.answer or {}
@@ -302,9 +360,11 @@ def _validate_answer_contract(config: DomainConfig) -> None:
         raise ValueError("answer.citation_rule is required")
 
     for key in ("grounding_rules", "repair_rules"):
-        if key in answer and not isinstance(answer[key], list):
-            raise ValueError(f"answer.{key} must be a list of strings")
-        for idx, value in enumerate(answer.get(key) or []):
+        if key not in answer:
+            raise ValueError(f"answer.{key} is required")
+        if not isinstance(answer[key], list) or not answer[key]:
+            raise ValueError(f"answer.{key} must be a non-empty list of strings")
+        for idx, value in enumerate(answer[key]):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"answer.{key}[{idx}] must be a non-empty string")
 
@@ -313,6 +373,19 @@ def _validate_document_aggregation(config: DomainConfig) -> None:
     aggregation = config.document_aggregation or {}
     if not isinstance(aggregation, dict):
         raise ValueError("document_aggregation must be an object")
+
+    required_keys = (
+        "criticality_rank",
+        "delivery_rank",
+        "decision",
+        "weighted_top_limits",
+        "ignore_values",
+        "signal",
+        "score_weights",
+    )
+    missing = [key for key in required_keys if key not in aggregation]
+    if missing:
+        raise ValueError("document_aggregation is missing required keys: " + ", ".join(missing))
 
     role_values = _schema_values(config, "role")
     criticality_values = _schema_values(config, "criticality")
@@ -324,87 +397,92 @@ def _validate_document_aggregation(config: DomainConfig) -> None:
         ("document_aggregation.criticality_rank", aggregation.get("criticality_rank"), criticality_values),
         ("document_aggregation.delivery_rank", aggregation.get("delivery_rank"), delivery_values),
     ):
-        if mapping is None:
-            continue
-        if not isinstance(mapping, dict):
-            raise ValueError(f"{context} must be an object")
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError(f"{context} must be a non-empty object")
         _validate_value_members(context=context, values=mapping.keys(), allowed=allowed)
         _validate_numeric_mapping(context, mapping)
 
-    decision = aggregation.get("decision") or {}
-    if decision and not isinstance(decision, dict):
-        raise ValueError("document_aggregation.decision must be an object")
+    decision = _require_object(aggregation, "document_aggregation", "decision")
+    for key in ("primary_values", "drop_values"):
+        _require_list(decision, "document_aggregation.decision", key)
     _validate_value_members(
         context="document_aggregation.decision.primary_values",
         values=decision.get("primary_values"),
         allowed=decision_values,
+        allow_empty=False,
     )
     _validate_value_members(
         context="document_aggregation.decision.drop_values",
         values=decision.get("drop_values"),
         allowed=decision_values,
+        allow_empty=False,
     )
-    if "default" in decision:
-        _validate_value_members(
-            context="document_aggregation.decision.default",
-            values=[decision.get("default")],
-            allowed=decision_values,
-            allow_empty=False,
-        )
-
-    signal = aggregation.get("signal") or {}
-    if signal and not isinstance(signal, dict):
-        raise ValueError("document_aggregation.signal must be an object")
-    boolean_flags = {str(x) for x in _as_list(config.metadata_schema.get("boolean_flags"))}
+    if "default" not in decision:
+        raise ValueError("document_aggregation.decision.default is required")
     _validate_value_members(
-        context="document_aggregation.signal.decision_values",
-        values=signal.get("decision_values"),
+        context="document_aggregation.decision.default",
+        values=[decision.get("default")],
         allowed=decision_values,
+        allow_empty=False,
     )
-    _validate_value_members(
-        context="document_aggregation.signal.delivery_values",
-        values=signal.get("delivery_values"),
-        allowed=delivery_values,
-    )
-    _validate_value_members(
-        context="document_aggregation.signal.criticality_values",
-        values=signal.get("criticality_values"),
-        allowed=criticality_values,
-    )
-    _validate_value_members(
-        context="document_aggregation.signal.roles",
-        values=signal.get("roles"),
-        allowed=role_values,
-    )
-    for flag in _as_list(signal.get("flags")):
-        if str(flag) not in boolean_flags:
-            raise ValueError(f"document_aggregation.signal.flags contains unknown flag {flag!r}")
-    if "max_signal_chunks" in signal and int(signal["max_signal_chunks"]) < 0:
-        raise ValueError("document_aggregation.signal.max_signal_chunks must be >= 0")
 
-    top_limits = aggregation.get("weighted_top_limits") or {}
-    if top_limits and not isinstance(top_limits, dict):
-        raise ValueError("document_aggregation.weighted_top_limits must be an object")
-    for key, value in top_limits.items():
-        if int(value) < 0:
+    limits = _require_object(aggregation, "document_aggregation", "weighted_top_limits")
+    for key in ("roles", "facets", "layers", "stages"):
+        _require_numeric(limits, "document_aggregation.weighted_top_limits", key)
+        if int(limits[key]) < 0:
             raise ValueError(f"document_aggregation.weighted_top_limits.{key} must be >= 0")
 
+    ignore_values_raw = _require_list(aggregation, "document_aggregation", "ignore_values")
     ignore_values = set()
     for logical_name in REQUIRED_METADATA_LOGICAL_FIELDS:
         ignore_values.update(_schema_values(config, logical_name))
     _validate_value_members(
         context="document_aggregation.ignore_values",
-        values=aggregation.get("ignore_values"),
+        values=ignore_values_raw,
         allowed=ignore_values,
+        allow_empty=False,
     )
 
-    score_weights = aggregation.get("score_weights") or {}
-    if score_weights and not isinstance(score_weights, dict):
-        raise ValueError("document_aggregation.score_weights must be an object")
+    signal = _require_object(aggregation, "document_aggregation", "signal")
+    boolean_flags = {str(x) for x in _as_list(config.metadata_schema.get("boolean_flags"))}
+    for key in ("decision_values", "delivery_values", "criticality_values", "roles", "flags"):
+        _require_list(signal, "document_aggregation.signal", key)
+    _validate_value_members(
+        context="document_aggregation.signal.decision_values",
+        values=signal.get("decision_values"),
+        allowed=decision_values,
+        allow_empty=False,
+    )
+    _validate_value_members(
+        context="document_aggregation.signal.delivery_values",
+        values=signal.get("delivery_values"),
+        allowed=delivery_values,
+        allow_empty=False,
+    )
+    _validate_value_members(
+        context="document_aggregation.signal.criticality_values",
+        values=signal.get("criticality_values"),
+        allowed=criticality_values,
+        allow_empty=False,
+    )
+    _validate_value_members(
+        context="document_aggregation.signal.roles",
+        values=signal.get("roles"),
+        allowed=role_values,
+        allow_empty=False,
+    )
+    _validate_value_members(
+        context="document_aggregation.signal.flags",
+        values=signal.get("flags"),
+        allowed=boolean_flags,
+        allow_empty=False,
+    )
+    if not isinstance(signal.get("max_signal_chunks"), int) or int(signal["max_signal_chunks"]) < 0:
+        raise ValueError("document_aggregation.signal.max_signal_chunks must be a non-negative integer")
 
+    score_weights = _require_object(aggregation, "document_aggregation", "score_weights")
     for scalar_key in ("base", "confidence"):
-        if scalar_key in score_weights and not isinstance(score_weights[scalar_key], (int, float)):
-            raise ValueError(f"document_aggregation.score_weights.{scalar_key} must be numeric")
+        _require_numeric(score_weights, "document_aggregation.score_weights", scalar_key)
 
     weighted_fields = {
         "role": role_values,
@@ -429,21 +507,25 @@ def _validate_document_aggregation(config: DomainConfig) -> None:
         if key not in {"base", "confidence", *weighted_fields.keys()}:
             raise ValueError(f"document_aggregation.score_weights has unknown key {key!r}")
 
-
 def _validate_rerank(config: DomainConfig) -> None:
     """Validate metadata prior configuration.
 
     Field keys may be logical names (criticality, decision, role, ...) or the
-    configured payload names (safety_relevance, corpus_decision, ...). Mapping
-    keys inside each field must be valid enum values for that logical field;
-    this catches typos like "primarry" before a rerank silently stops working.
+    configured payload names from the active domain pack. Mapping keys inside
+    each field must be valid enum values for that logical field; this catches
+    typos like "primarry" before a rerank silently stops working.
     """
     rerank = config.rerank or {}
     if not isinstance(rerank, dict):
         raise ValueError("rerank must be an object")
 
-    base_weights = rerank.get("base_weights") or {}
-    if base_weights and not isinstance(base_weights, dict):
+    required_keys = ("clamp", "base_weights", "confidence_weight", "hit_weights")
+    missing = [key for key in required_keys if key not in rerank]
+    if missing:
+        raise ValueError("rerank is missing required keys: " + ", ".join(missing))
+
+    base_weights = rerank.get("base_weights")
+    if not isinstance(base_weights, dict):
         raise ValueError("rerank.base_weights must be an object")
     for key, mapping in base_weights.items():
         logical_name = _logical_for_weight_key(config, str(key))
@@ -459,19 +541,22 @@ def _validate_rerank(config: DomainConfig) -> None:
             mapping=mapping,
         )
 
-    if "confidence_weight" in rerank and not isinstance(rerank["confidence_weight"], (int, float)):
+    if not isinstance(rerank["confidence_weight"], (int, float)):
         raise ValueError("rerank.confidence_weight must be numeric")
 
-    if "clamp" in rerank:
-        clamp = rerank["clamp"]
-        if not isinstance(clamp, list) or len(clamp) != 2 or not all(isinstance(x, (int, float)) for x in clamp):
-            raise ValueError("rerank.clamp must be a two-number list")
-        if float(clamp[0]) > float(clamp[1]):
-            raise ValueError("rerank.clamp lower bound must be <= upper bound")
+    clamp = rerank["clamp"]
+    if not isinstance(clamp, list) or len(clamp) != 2 or not all(isinstance(x, (int, float)) for x in clamp):
+        raise ValueError("rerank.clamp must be a two-number list")
+    if float(clamp[0]) > float(clamp[1]):
+        raise ValueError("rerank.clamp lower bound must be <= upper bound")
 
-    hit_weights = rerank.get("hit_weights") or {}
-    if hit_weights and not isinstance(hit_weights, dict):
+    hit_weights = rerank.get("hit_weights")
+    if not isinstance(hit_weights, dict):
         raise ValueError("rerank.hit_weights must be an object")
+    for required_hit in ("role", "facet", "layer", "stage", "flag"):
+        if required_hit not in hit_weights:
+            raise ValueError(f"rerank.hit_weights.{required_hit} is required")
+
     allowed_hit_keys = {"role", "facet", "facets", "layer", "layers", "stage", "stages", "flag", "flags"}
     for key, value in hit_weights.items():
         if key not in allowed_hit_keys:
@@ -480,6 +565,9 @@ def _validate_rerank(config: DomainConfig) -> None:
             )
         if isinstance(value, dict):
             allowed_inner = {"per_hit", "cap"}
+            for required_inner in allowed_inner:
+                if required_inner not in value:
+                    raise ValueError(f"rerank.hit_weights.{key}.{required_inner} is required")
             for inner_key in value.keys():
                 if inner_key not in allowed_inner:
                     raise ValueError(
@@ -490,10 +578,25 @@ def _validate_rerank(config: DomainConfig) -> None:
         elif not isinstance(value, (int, float)):
             raise ValueError(f"rerank.hit_weights.{key} must be numeric or an object")
 
+def _validate_runtime_defaults(config: DomainConfig) -> None:
+    if not isinstance(config.retrieval_defaults, dict):
+        raise ValueError("retrieval_defaults must be an object")
+    for key in ("top_k", "pre_k", "max_per_file", "neighbor_radius"):
+        _require_numeric(config.retrieval_defaults, "retrieval_defaults", key)
+
+    if not isinstance(config.context_defaults, dict):
+        raise ValueError("context_defaults must be an object")
+    for key in ("selected_max_chars", "neighbor_snippet_chars", "context_max_chars"):
+        _require_numeric(config.context_defaults, "context_defaults", key)
+
+    if not isinstance(config.query_profiles, list):
+        raise ValueError("query_profiles must be a list")
+
+
 def validate_domain_config(config: DomainConfig) -> None:
     """Fail fast when a domain config is internally inconsistent.
 
-    This validates the domain boundary rather than relying on ADAS compatibility
+    This validates the domain boundary rather than relying on code-level policy
     fallbacks. A domain pack should fail loudly if extraction, validation,
     reranking, answer contract, or document aggregation policies are internally
     inconsistent.
@@ -502,6 +605,8 @@ def validate_domain_config(config: DomainConfig) -> None:
         raise ValueError("domain config id is required")
     if not config.collection:
         raise ValueError("domain config collection is required")
+
+    _validate_runtime_defaults(config)
 
     metadata_schema = config.metadata_schema or {}
     metadata_fields = config.metadata_fields or {}
