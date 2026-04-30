@@ -519,10 +519,15 @@ def _validate_rerank(config: DomainConfig) -> None:
     if not isinstance(rerank, dict):
         raise ValueError("rerank must be an object")
 
-    required_keys = ("clamp", "base_weights", "confidence_weight", "hit_weights")
+    required_keys = ("mode", "clamp", "base_weights", "confidence_weight", "hit_weights")
     missing = [key for key in required_keys if key not in rerank]
     if missing:
         raise ValueError("rerank is missing required keys: " + ", ".join(missing))
+
+    mode = rerank.get("mode")
+    allowed_modes = {"full", "value_weights_only", "disabled"}
+    if not isinstance(mode, str) or mode not in allowed_modes:
+        raise ValueError(f"rerank.mode must be one of {sorted(allowed_modes)}")
 
     base_weights = rerank.get("base_weights")
     if not isinstance(base_weights, dict):
