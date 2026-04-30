@@ -107,11 +107,6 @@ ABLATION_VARIANTS: list[dict[str, Any]] = [
         "env": {"RAG_RERANK_MODE": "value_weights_only"},
     },
     {
-        "name": "dual_union_disabled_value",
-        "description": "Experimental two-ranker union: dense/disabled top-k plus value_weights_only top-k. Measures whether two rankers are worth the extra context/noise.",
-        "env": {"RAG_RETRIEVAL_ENSEMBLE": "disabled,value_weights_only", "RAG_RERANK_MODE": "value_weights_only"},
-    },
-    {
         "name": "no_flags_in_rerank",
         "description": "Force full mode and disable boolean flag hit bonus only.",
         "env": {"RAG_RERANK_MODE": "full", "RAG_ABLATION_NO_FLAGS_IN_RERANK": "1"},
@@ -251,8 +246,8 @@ RERANK_SELECTION_EVIDENCE_LEDGER: list[dict[str, Any]] = [
     },
     {
         "hypothesis": "dual_union_can_combine_disabled_and_value_only",
-        "result": "Retrieval-only study showed dual_union matched value_weights_only without clear uplift, adding context complexity without proven benefit.",
-        "decision": "Keep dual_union experimental and exclude it from expensive default sweeps unless retrieval disagreement suggests value.",
+        "result": "Retrieval-only study showed dual_union matched value_weights_only without clear uplift, adding context and implementation complexity.",
+        "decision": "Retire dual_union from the active engine/study surface; reintroduce only if a future generic-domain eval proves complementary ranker evidence.",
     },
     {
         "hypothesis": "metadata_system_should_be_deleted_if_rerank_is_disabled",
@@ -1473,8 +1468,6 @@ def run_compare(args: argparse.Namespace) -> None:
 
     if args.study == "adas_rerank_selection" and not args.variant:
         wanted_names = list(STUDY_VARIANTS)
-        if args.include_dual_union:
-            wanted_names.append("dual_union_disabled_value")
         wanted = set(wanted_names)
         variants = [v for v in ABLATION_VARIANTS if v["name"] in wanted]
         # Study mode is about answer/judge selection. Keep retrieval-only allowed
@@ -1883,7 +1876,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare", action="store_true", help="Run built-in ablation comparison instead of a single retrieval eval.")
     parser.add_argument("--study", choices=["adas_rerank_selection"], help="Run a predefined paired/slice study. Implies --compare; unless --retrieval-only, also implies --answer --judge.")
     parser.add_argument("--repeat", type=int, default=1, help="Repeat expensive answer/judge runs per variant for stochastic LLM stability. Retrieval-only compare ignores repeats.")
-    parser.add_argument("--include-dual-union", action="store_true", help="With --study, also test experimental dual_union_disabled_value.")
     parser.add_argument("--retrieval-only", action="store_true", help="With --compare/--study, make the cheap retrieval-only mode explicit.")
     parser.add_argument("--answer", action="store_true", help="With --compare, also run eval_answer.py for each variant.")
     parser.add_argument("--judge", action="store_true", help="With --compare, enable eval_answer.py LLM judge. Implies --answer.")

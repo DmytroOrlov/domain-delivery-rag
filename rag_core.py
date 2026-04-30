@@ -80,8 +80,8 @@ CONTEXT_MAX_CHARS = int(os.environ.get("RAG_CONTEXT_MAX_CHARS", str(_required_co
 
 # Bounded metadata rerank. This is a heuristic, not a learned ranker.
 # It can reorder close dense candidates; this is intentional but must remain
-# measurable. `eval_metadata_ablation.py` compares raw dense retrieval against
-# dense+metadata reranking so weight changes are reviewable instead of guessed.
+# measurable. The current measurement path is eval_retrieval.py --study
+# adas_rerank_selection; eval_metadata_ablation.py is only a compatibility shim.
 #
 # RAG_METADATA_PRIOR=0 disables the heuristic globally for normal callers.
 # Ablation code can also override it per call through retrieve_dense(...,
@@ -116,39 +116,12 @@ def _configured_rerank_mode() -> str:
 RERANK_MODE = _configured_rerank_mode()
 
 
-def _parse_retrieval_ensemble_modes() -> list[str]:
-    """Return optional deterministic retrieval-ensemble modes for eval/study runs.
-
-    This is intentionally an explicit runtime override, not domain policy. It
-    lets eval compare "run one ranker" with "union evidence from two rankers"
-    without changing ingestion or the domain config. Example:
-
-        RAG_RETRIEVAL_ENSEMBLE=disabled,value_weights_only
-
-    Normal production/runtime calls leave this unset and use the single active
-    rerank mode from the domain config / RAG_RERANK_MODE override.
-    """
-    raw = os.environ.get("RAG_RETRIEVAL_ENSEMBLE", "").strip()
-    if not raw:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in raw.split(","):
-        mode = part.strip().lower()
-        if not mode:
-            continue
-        if mode not in ALLOWED_RERANK_MODES:
-            raise ValueError(
-                f"Unsupported RAG_RETRIEVAL_ENSEMBLE mode {mode!r}; "
-                f"allowed: {sorted(ALLOWED_RERANK_MODES)}"
-            )
-        if mode not in seen:
-            out.append(mode)
-            seen.add(mode)
-    return out
-
-
-RETRIEVAL_ENSEMBLE_MODES = _parse_retrieval_ensemble_modes()
+# Retrieval ensembles / "dual union" were tested as a way to combine the
+# disabled dense baseline with value-only rerank. Retrieval-only study showed no
+# uplift over value_weights_only while adding context/diagnostic complexity, so
+# the runtime no longer supports RAG_RETRIEVAL_ENSEMBLE. Keep the summary field
+# as an always-empty list so older run artifact readers do not break.
+RETRIEVAL_ENSEMBLE_MODES: list[str] = []
 
 # RAG_METADATA_PRIOR remains a coarse production kill switch.
 # RAG_ABLATION_NO_METADATA_RERANK is a one-way eval switch. Neither can
@@ -631,43 +604,6 @@ def _select_diverse(candidates: list[dict[str, Any]], top_k: int, max_per_file: 
     return selected
 
 
-def _select_ensemble_union(
-    ranked_by_mode: dict[str, list[dict[str, Any]]],
-    top_k: int,
-    max_per_file: int,
-) -> list[dict[str, Any]]:
-    """Stable union of each ensemble ranker's selected top-k.
-
-    This intentionally may return more than `top_k` items: it is an experimental
-    evidence-union candidate for eval, not a replacement for the normal single
-    ranker. Neighbor/context caps still bound the final prompt.
-    """
-    out: list[dict[str, Any]] = []
-    seen: set[tuple[str, int | str, str]] = set()
-    selected_rank_by_mode: dict[tuple[str, int | str, str], dict[str, int]] = {}
-
-    for mode in RETRIEVAL_ENSEMBLE_MODES:
-        mode_selected = _select_diverse(ranked_by_mode[mode], top_k=top_k, max_per_file=max_per_file)
-        for rank, item in enumerate(mode_selected, start=1):
-            key = _candidate_key(item)
-            selected_rank_by_mode.setdefault(key, {})[mode] = rank
-            if key in seen:
-                continue
-            seen.add(key)
-            copied = dict(item)
-            copied["retrieval_ensemble_modes"] = list(RETRIEVAL_ENSEMBLE_MODES)
-            copied["retrieval_ensemble_selected_by"] = [mode]
-            out.append(copied)
-
-    for item in out:
-        key = _candidate_key(item)
-        ranks = selected_rank_by_mode.get(key, {})
-        item["retrieval_ensemble_selected_rank_by_mode"] = ranks
-        item["retrieval_ensemble_selected_by"] = [m for m in RETRIEVAL_ENSEMBLE_MODES if m in ranks]
-
-    return out
-
-
 def retrieve_dense(
     question: str,
     top_k: int = DEFAULT_TOP_K,
@@ -699,28 +635,10 @@ def retrieve_dense(
         with_payload=True,
     ).points
 
-    # Normal runtime uses one ranker. Study mode can request a deterministic
-    # evidence union from multiple rankers by setting RAG_RETRIEVAL_ENSEMBLE.
-    # Explicit retrieve_dense(..., use_metadata_prior=True/False) calls keep the
-    # old single-ranker behavior, which matters for legacy ablation tests.
-    if use_metadata_prior is None and RETRIEVAL_ENSEMBLE_MODES:
-        ranked_by_mode = {
-            mode: _rank_raw_points(
-                raw,
-                question=question,
-                mode=mode,
-                use_metadata_prior=(mode != "disabled"),
-            )
-            for mode in RETRIEVAL_ENSEMBLE_MODES
-        }
-        selected = _select_ensemble_union(ranked_by_mode, top_k=top_k, max_per_file=max_per_file)
-        # Return the first ensemble member's full candidate list as the dense/rank
-        # diagnostic backbone, and annotate it so run artifacts make the ensemble
-        # behavior explicit.
-        candidates = ranked_by_mode[RETRIEVAL_ENSEMBLE_MODES[0]]
-        for item in candidates:
-            item["retrieval_ensemble_modes"] = list(RETRIEVAL_ENSEMBLE_MODES)
-        return selected, candidates
+    # Normal runtime uses exactly one ranker. We intentionally retired the
+    # experimental dual-union branch: it did not beat the simpler candidates in
+    # retrieval-only study and it complicated context/debug semantics. Generic
+    # domains can still choose full/value/disabled rerank through domain config.
 
     candidates = _rank_raw_points(
         raw,
