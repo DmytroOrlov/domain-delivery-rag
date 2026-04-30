@@ -90,7 +90,92 @@ RERANK_CONFIG = dict(getattr(DOMAIN, "rerank", {}) or {})
 RERANK_CLAMP = _required_config_value(RERANK_CONFIG, "clamp", "rerank")
 META_MIN = float(os.environ.get("RAG_META_MIN", str(RERANK_CLAMP[0])))
 META_MAX = float(os.environ.get("RAG_META_MAX", str(RERANK_CLAMP[1])))
-METADATA_PRIOR_ENABLED = os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+ALLOWED_RERANK_MODES = {"full", "value_weights_only", "disabled"}
+
+def _configured_rerank_mode() -> str:
+    """Return the domain-configured rerank mode, optionally overridden for eval.
+
+    `rerank.mode` is production domain policy. `RAG_RERANK_MODE` exists only as
+    an explicit run/eval override so ablation variants can compare current
+    production behavior against full or disabled rerank without editing JSON.
+    """
+    raw = os.environ.get("RAG_RERANK_MODE", str(_required_config_value(RERANK_CONFIG, "mode", "rerank")))
+    mode = raw.strip().lower()
+    if mode not in ALLOWED_RERANK_MODES:
+        raise ValueError(f"Unsupported rerank.mode/RAG_RERANK_MODE {raw!r}; allowed: {sorted(ALLOWED_RERANK_MODES)}")
+    return mode
+
+
+RERANK_MODE = _configured_rerank_mode()
+
+
+def _parse_retrieval_ensemble_modes() -> list[str]:
+    """Return optional deterministic retrieval-ensemble modes for eval/study runs.
+
+    This is intentionally an explicit runtime override, not domain policy. It
+    lets eval compare "run one ranker" with "union evidence from two rankers"
+    without changing ingestion or the domain config. Example:
+
+        RAG_RETRIEVAL_ENSEMBLE=disabled,value_weights_only
+
+    Normal production/runtime calls leave this unset and use the single active
+    rerank mode from the domain config / RAG_RERANK_MODE override.
+    """
+    raw = os.environ.get("RAG_RETRIEVAL_ENSEMBLE", "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        mode = part.strip().lower()
+        if not mode:
+            continue
+        if mode not in ALLOWED_RERANK_MODES:
+            raise ValueError(
+                f"Unsupported RAG_RETRIEVAL_ENSEMBLE mode {mode!r}; "
+                f"allowed: {sorted(ALLOWED_RERANK_MODES)}"
+            )
+        if mode not in seen:
+            out.append(mode)
+            seen.add(mode)
+    return out
+
+
+RETRIEVAL_ENSEMBLE_MODES = _parse_retrieval_ensemble_modes()
+
+# RAG_METADATA_PRIOR remains a coarse production kill switch.
+# RAG_ABLATION_NO_METADATA_RERANK is a one-way eval switch. Neither can
+# accidentally enable rerank if the domain config says mode=disabled.
+METADATA_PRIOR_ENABLED = (
+    RERANK_MODE != "disabled"
+    and os.environ.get("RAG_METADATA_PRIOR", "1") != "0"
+    and not env_flag("RAG_ABLATION_NO_METADATA_RERANK")
+)
+EFFECTIVE_RERANK_MODE = RERANK_MODE if METADATA_PRIOR_ENABLED else "disabled"
+
+ABLATION_NO_QUERY_PROFILES = env_flag("RAG_ABLATION_NO_QUERY_PROFILES")
+ABLATION_NO_ROLE_HITS = env_flag("RAG_ABLATION_NO_ROLE_HITS_IN_RERANK")
+ABLATION_NO_FACET_HITS = env_flag("RAG_ABLATION_NO_FACETS_IN_RERANK")
+ABLATION_NO_LAYER_HITS = env_flag("RAG_ABLATION_NO_LAYERS_IN_RERANK")
+ABLATION_NO_STAGE_HITS = env_flag("RAG_ABLATION_NO_STAGES_IN_RERANK")
+ABLATION_NO_FLAG_HITS = env_flag("RAG_ABLATION_NO_FLAGS_IN_RERANK")
+ABLATION_NO_CONFIDENCE = env_flag("RAG_ABLATION_NO_CONFIDENCE_IN_RERANK")
+ABLATION_NO_VALUE_WEIGHTS = env_flag("RAG_ABLATION_NO_VALUE_WEIGHTS_IN_RERANK")
+
+# Optional comma-separated allow-list for query profile names. This does not
+# delete profiles from the domain config; it only lets eval runs measure whether
+# a smaller hot-path subset is enough for a domain.
+_PROFILE_ALLOWLIST_RAW = os.environ.get("RAG_ABLATION_QUERY_PROFILE_NAMES", "").strip()
+ABLATION_QUERY_PROFILE_NAMES = {
+    x.strip() for x in _PROFILE_ALLOWLIST_RAW.split(",") if x.strip()
+}
 
 VERBOSE = os.environ.get("RAG_VERBOSE", "1") != "0"
 DEBUG = os.environ.get("RAG_DEBUG", "0") == "1"
@@ -351,15 +436,27 @@ def query_profile(query: str) -> dict[str, set[str]]:
     tokens = set(tokenize_query(query))
     profile = _empty_query_profile()
 
+    if ABLATION_NO_QUERY_PROFILES:
+        return profile
+
     for rule in getattr(DOMAIN, "query_profiles", []):
+        if ABLATION_QUERY_PROFILE_NAMES:
+            rule_name = str(rule.get("name") or "").strip()
+            if rule_name not in ABLATION_QUERY_PROFILE_NAMES:
+                continue
         if not _query_profile_rule_matches(q, tokens, rule):
             continue
 
-        profile["roles"].update(_as_list(rule.get("add_roles")))
-        profile["facets"].update(_as_list(rule.get("add_facets")))
-        profile["layers"].update(_as_list(rule.get("add_layers")))
-        profile["stages"].update(_as_list(rule.get("add_stages")))
-        profile["flags"].update(_as_list(rule.get("add_flags")))
+        if not ABLATION_NO_ROLE_HITS:
+            profile["roles"].update(_as_list(rule.get("add_roles")))
+        if not ABLATION_NO_FACET_HITS:
+            profile["facets"].update(_as_list(rule.get("add_facets")))
+        if not ABLATION_NO_LAYER_HITS:
+            profile["layers"].update(_as_list(rule.get("add_layers")))
+        if not ABLATION_NO_STAGE_HITS:
+            profile["stages"].update(_as_list(rule.get("add_stages")))
+        if not ABLATION_NO_FLAG_HITS:
+            profile["flags"].update(_as_list(rule.get("add_flags")))
 
     return profile
 
@@ -412,7 +509,7 @@ def _value_weight_for(
     return _value_weight(weights, key, value)
 
 
-def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
+def metadata_prior(payload: dict[str, Any], query: str = "", mode: str | None = None) -> float:
     """
     Bounded heuristic rerank.
 
@@ -420,23 +517,37 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     answer evidence and should not be cited by the model.
 
     The mechanism is generic; the weights and metadata field mapping are domain
-    policy loaded from the active domain config.
+    policy loaded from the active domain config. `mode` is only for eval/study
+    code that needs to score the same dense candidate set under multiple rankers
+    in one process.
     """
+    effective_mode = (mode or EFFECTIVE_RERANK_MODE).strip().lower()
+    if effective_mode not in ALLOWED_RERANK_MODES:
+        raise ValueError(f"Unsupported rerank mode {effective_mode!r}; allowed: {sorted(ALLOWED_RERANK_MODES)}")
+    if effective_mode == "disabled":
+        return 0.0
+
     bonus = 0.0
     rerank = RERANK_CONFIG
     base_weights = _required_config_value(rerank, "base_weights", "rerank")
     hit_weights = _required_config_value(rerank, "hit_weights", "rerank")
 
-    bonus += _value_weight_for(base_weights, "decision", payload)
-    bonus += _value_weight_for(base_weights, "delivery_value", payload)
-    bonus += _value_weight_for(base_weights, "criticality", payload)
-    bonus += _value_weight_for(base_weights, "role", payload)
+    use_value_weights = effective_mode in {"full", "value_weights_only"} and not ABLATION_NO_VALUE_WEIGHTS
+    use_confidence_weight = effective_mode in {"full", "value_weights_only"} and not ABLATION_NO_CONFIDENCE
+    use_hit_weights = effective_mode == "full"
 
-    try:
-        confidence_weight = float(_required_config_value(rerank, "confidence_weight", "rerank"))
-        bonus += min(float(payload.get("confidence") or 0.0), 1.0) * confidence_weight
-    except Exception:
-        pass
+    if use_value_weights:
+        bonus += _value_weight_for(base_weights, "decision", payload)
+        bonus += _value_weight_for(base_weights, "delivery_value", payload)
+        bonus += _value_weight_for(base_weights, "criticality", payload)
+        bonus += _value_weight_for(base_weights, "role", payload)
+
+    if use_confidence_weight:
+        try:
+            confidence_weight = float(_required_config_value(rerank, "confidence_weight", "rerank"))
+            bonus += min(float(payload.get("confidence") or 0.0), 1.0) * confidence_weight
+        except Exception:
+            pass
 
     profile = query_profile(query)
 
@@ -445,21 +556,117 @@ def metadata_prior(payload: dict[str, Any], query: str = "") -> float:
     layer_hits = _intersect_count(payload_layers(payload), profile["layers"])
     stage_hits = _intersect_count(payload_stages(payload), profile["stages"])
 
-    bonus += _hit_weight(_required_config_value(hit_weights, "role", "rerank.hit_weights"), role_hits)
-    bonus += _hit_weight(_required_config_value(hit_weights, "facet", "rerank.hit_weights"), facet_hits)
-    bonus += _hit_weight(_required_config_value(hit_weights, "layer", "rerank.hit_weights"), layer_hits)
-    bonus += _hit_weight(_required_config_value(hit_weights, "stage", "rerank.hit_weights"), stage_hits)
+    if use_hit_weights and not ABLATION_NO_ROLE_HITS:
+        bonus += _hit_weight(_required_config_value(hit_weights, "role", "rerank.hit_weights"), role_hits)
+    if use_hit_weights and not ABLATION_NO_FACET_HITS:
+        bonus += _hit_weight(_required_config_value(hit_weights, "facet", "rerank.hit_weights"), facet_hits)
+    if use_hit_weights and not ABLATION_NO_LAYER_HITS:
+        bonus += _hit_weight(_required_config_value(hit_weights, "layer", "rerank.hit_weights"), layer_hits)
+    if use_hit_weights and not ABLATION_NO_STAGE_HITS:
+        bonus += _hit_weight(_required_config_value(hit_weights, "stage", "rerank.hit_weights"), stage_hits)
 
-    flag_weight = float(_required_config_value(hit_weights, "flag", "rerank.hit_weights"))
-    for flag in profile["flags"]:
-        if payload.get(flag) is True:
-            bonus += flag_weight
+    if use_hit_weights and not ABLATION_NO_FLAG_HITS:
+        flag_weight = float(_required_config_value(hit_weights, "flag", "rerank.hit_weights"))
+        for flag in profile["flags"]:
+            if payload.get(flag) is True:
+                bonus += flag_weight
 
     return _clamp(bonus, META_MIN, META_MAX)
 
 # =============================================================================
 # Dense retrieval and neighbor expansion
 # =============================================================================
+
+def _candidate_key(item: dict[str, Any]) -> tuple[str, int | str, str]:
+    payload = item.get("payload") or {}
+    file_path = str(payload.get("file_path") or "")
+    chunk_index = payload.get("chunk_index")
+    try:
+        chunk_key: int | str = int(chunk_index)
+    except Exception:
+        chunk_key = str(chunk_index or "")
+    fallback = str(payload.get("chunk_id") or payload.get("source_id") or payload.get("text", "")[:80])
+    return (file_path, chunk_key, fallback)
+
+
+def _rank_raw_points(
+    raw: list[Any],
+    question: str,
+    mode: str,
+    use_metadata_prior: bool,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for rank, point in enumerate(raw, start=1):
+        payload = point.payload or {}
+        vector_score = float(point.score)
+        meta_bonus = metadata_prior(payload, query=question, mode=mode) if use_metadata_prior else 0.0
+        final_score = vector_score + meta_bonus
+        item = RetrievalItem(
+            payload=payload,
+            dense_rank=rank,
+            vector_score=vector_score,
+            meta_bonus=meta_bonus,
+            final_score=final_score,
+            is_selected_hit=True,
+        ).as_dict()
+        item["rerank_mode"] = mode
+        candidates.append(item)
+
+    candidates.sort(key=lambda x: x["final_score"], reverse=True)
+    return candidates
+
+
+def _select_diverse(candidates: list[dict[str, Any]], top_k: int, max_per_file: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    per_file: dict[str, int] = {}
+    for item in candidates:
+        payload = item["payload"]
+        file_path = payload.get("file_path", "unknown")
+        if per_file.get(file_path, 0) >= max_per_file:
+            continue
+        selected.append(item)
+        per_file[file_path] = per_file.get(file_path, 0) + 1
+        if len(selected) >= top_k:
+            break
+    return selected
+
+
+def _select_ensemble_union(
+    ranked_by_mode: dict[str, list[dict[str, Any]]],
+    top_k: int,
+    max_per_file: int,
+) -> list[dict[str, Any]]:
+    """Stable union of each ensemble ranker's selected top-k.
+
+    This intentionally may return more than `top_k` items: it is an experimental
+    evidence-union candidate for eval, not a replacement for the normal single
+    ranker. Neighbor/context caps still bound the final prompt.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | str, str]] = set()
+    selected_rank_by_mode: dict[tuple[str, int | str, str], dict[str, int]] = {}
+
+    for mode in RETRIEVAL_ENSEMBLE_MODES:
+        mode_selected = _select_diverse(ranked_by_mode[mode], top_k=top_k, max_per_file=max_per_file)
+        for rank, item in enumerate(mode_selected, start=1):
+            key = _candidate_key(item)
+            selected_rank_by_mode.setdefault(key, {})[mode] = rank
+            if key in seen:
+                continue
+            seen.add(key)
+            copied = dict(item)
+            copied["retrieval_ensemble_modes"] = list(RETRIEVAL_ENSEMBLE_MODES)
+            copied["retrieval_ensemble_selected_by"] = [mode]
+            out.append(copied)
+
+    for item in out:
+        key = _candidate_key(item)
+        ranks = selected_rank_by_mode.get(key, {})
+        item["retrieval_ensemble_selected_rank_by_mode"] = ranks
+        item["retrieval_ensemble_selected_by"] = [m for m in RETRIEVAL_ENSEMBLE_MODES if m in ranks]
+
+    return out
+
 
 def retrieve_dense(
     question: str,
@@ -492,36 +699,36 @@ def retrieve_dense(
         with_payload=True,
     ).points
 
-    candidates = []
-    for rank, point in enumerate(raw, start=1):
-        payload = point.payload or {}
-        vector_score = float(point.score)
-        meta_bonus = metadata_prior(payload, query=question) if use_metadata_prior else 0.0
-        final_score = vector_score + meta_bonus
-        candidates.append(
-            RetrievalItem(
-                payload=payload,
-                dense_rank=rank,
-                vector_score=vector_score,
-                meta_bonus=meta_bonus,
-                final_score=final_score,
-                is_selected_hit=True,
-            ).as_dict()
-        )
+    # Normal runtime uses one ranker. Study mode can request a deterministic
+    # evidence union from multiple rankers by setting RAG_RETRIEVAL_ENSEMBLE.
+    # Explicit retrieve_dense(..., use_metadata_prior=True/False) calls keep the
+    # old single-ranker behavior, which matters for legacy ablation tests.
+    if use_metadata_prior is None and RETRIEVAL_ENSEMBLE_MODES:
+        ranked_by_mode = {
+            mode: _rank_raw_points(
+                raw,
+                question=question,
+                mode=mode,
+                use_metadata_prior=(mode != "disabled"),
+            )
+            for mode in RETRIEVAL_ENSEMBLE_MODES
+        }
+        selected = _select_ensemble_union(ranked_by_mode, top_k=top_k, max_per_file=max_per_file)
+        # Return the first ensemble member's full candidate list as the dense/rank
+        # diagnostic backbone, and annotate it so run artifacts make the ensemble
+        # behavior explicit.
+        candidates = ranked_by_mode[RETRIEVAL_ENSEMBLE_MODES[0]]
+        for item in candidates:
+            item["retrieval_ensemble_modes"] = list(RETRIEVAL_ENSEMBLE_MODES)
+        return selected, candidates
 
-    candidates.sort(key=lambda x: x["final_score"], reverse=True)
-
-    selected = []
-    per_file: dict[str, int] = {}
-    for item in candidates:
-        payload = item["payload"]
-        file_path = payload.get("file_path", "unknown")
-        if per_file.get(file_path, 0) >= max_per_file:
-            continue
-        selected.append(item)
-        per_file[file_path] = per_file.get(file_path, 0) + 1
-        if len(selected) >= top_k:
-            break
+    candidates = _rank_raw_points(
+        raw,
+        question=question,
+        mode=EFFECTIVE_RERANK_MODE,
+        use_metadata_prior=bool(use_metadata_prior),
+    )
+    selected = _select_diverse(candidates, top_k=top_k, max_per_file=max_per_file)
 
     return selected, candidates
 
@@ -805,6 +1012,25 @@ def build_augmented_prompt(
     return prompt, debug_info
 
 
+
+def ablation_config_summary() -> dict[str, Any]:
+    return {
+        "rerank_mode_configured": RERANK_MODE,
+        "rerank_mode_effective": EFFECTIVE_RERANK_MODE,
+        "no_metadata_rerank": env_flag("RAG_ABLATION_NO_METADATA_RERANK"),
+        "no_query_profiles": ABLATION_NO_QUERY_PROFILES,
+        "query_profile_names": sorted(ABLATION_QUERY_PROFILE_NAMES),
+        "no_role_hits_in_rerank": ABLATION_NO_ROLE_HITS,
+        "no_facets_in_rerank": ABLATION_NO_FACET_HITS,
+        "no_layers_in_rerank": ABLATION_NO_LAYER_HITS,
+        "no_stages_in_rerank": ABLATION_NO_STAGE_HITS,
+        "no_flags_in_rerank": ABLATION_NO_FLAG_HITS,
+        "no_confidence_in_rerank": ABLATION_NO_CONFIDENCE,
+        "no_value_weights_in_rerank": ABLATION_NO_VALUE_WEIGHTS,
+        "retrieval_ensemble_modes": list(RETRIEVAL_ENSEMBLE_MODES),
+    }
+
+
 def retrieval_config_summary() -> dict[str, Any]:
     return {
         "domain_id": DOMAIN.id,
@@ -821,7 +1047,11 @@ def retrieval_config_summary() -> dict[str, Any]:
         "neighbor_snippet_chars": NEIGHBOR_SNIPPET_CHARS,
         "context_max_chars": CONTEXT_MAX_CHARS,
         "metadata_prior": "enabled" if METADATA_PRIOR_ENABLED else "disabled",
+        "rerank_mode_configured": RERANK_MODE,
+        "rerank_mode_effective": EFFECTIVE_RERANK_MODE,
+        "retrieval_ensemble_modes": list(RETRIEVAL_ENSEMBLE_MODES),
         "metadata_rerank_clamp": f"[{META_MIN:+.3f},{META_MAX:+.3f}]",
+        "ablation": ablation_config_summary(),
         "hybrid": "disabled/deferred",
     }
 
