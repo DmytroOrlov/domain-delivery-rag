@@ -7,6 +7,8 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,9 @@ import rag_core as rc
 #
 # One-case smoke test:
 #   python3 eval_answer.py --case blind_spot_warning_implications
+#
+# Fast expensive loop:
+#   python3 eval_answer.py --case-file eval_runs/problem_cases.txt
 # =============================================================================
 
 
@@ -76,8 +81,13 @@ RUNS_DIR = Path(
 
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
 
-ANSWER_MAX_TOKENS = int(os.environ.get("RAG_ANSWER_EVAL_MAX_TOKENS", "16384"))
-ANSWER_TIMEOUT = int(os.environ.get("RAG_ANSWER_EVAL_TIMEOUT", "1800"))
+# This eval intentionally does not set generation parameters on chat-completion
+# requests. The llama-server launch is the single source of truth for generation
+# policy, e.g. the user's launch currently sets:
+#   --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --reasoning on
+#   --reasoning-budget -1 --n-predict 16384
+# Keep eval-side controls to transport/evaluation behavior only.
+ANSWER_TIMEOUT = int(os.environ.get("RAG_ANSWER_EVAL_TIMEOUT", "3600"))
 DEFAULT_TOP_K = int(os.environ.get("RAG_ANSWER_EVAL_TOP_K", str(rc.DEFAULT_TOP_K)))
 
 MIN_ANSWER_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_MIN_CHARS", "600"))
@@ -93,10 +103,26 @@ SAVE_PROMPTS = os.environ.get("RAG_ANSWER_EVAL_SAVE_PROMPTS", "1") != "0"
 REPAIR_ON_CONTRACT_FAILURE = os.environ.get("RAG_ANSWER_EVAL_REPAIR_ON_CONTRACT_FAILURE", "0") != "0"
 MAX_REPAIR_ATTEMPTS = int(os.environ.get("RAG_ANSWER_EVAL_REPAIR_ATTEMPTS", "1"))
 
-# Optional deterministic sampling for answer eval only. By default we do not send
-# sampling params, preserving the llama-server defaults unless explicitly set.
-ANSWER_TEMPERATURE = os.environ.get("RAG_ANSWER_EVAL_TEMPERATURE")
-ANSWER_TOP_P = os.environ.get("RAG_ANSWER_EVAL_TOP_P")
+# Optional LLM-as-judge pass. Disabled by default so deterministic answer-contract
+# eval remains cheap and stable. Enable it for richer semantic/grounding metrics:
+#   RAG_ANSWER_EVAL_LLM_JUDGE=1 python3 eval_answer.py
+# The judge is advisory by default. To make it fail the eval gate, set:
+#   RAG_ANSWER_EVAL_LLM_JUDGE_GATE=1
+LLM_JUDGE_ENABLED = os.environ.get("RAG_ANSWER_EVAL_LLM_JUDGE", "0") == "1"
+LLM_JUDGE_GATE = os.environ.get("RAG_ANSWER_EVAL_LLM_JUDGE_GATE", "0") == "1"
+JUDGE_CHAT_URL = os.environ.get("RAG_ANSWER_EVAL_JUDGE_URL", CHAT_URL)
+
+# Judge uses the same llama-server generation policy as normal answers.
+# Do not send judge-side max_tokens/sampling overrides from eval_answer.py.
+JUDGE_TIMEOUT = int(os.environ.get("RAG_ANSWER_EVAL_JUDGE_TIMEOUT", str(ANSWER_TIMEOUT)))
+
+JUDGE_PROMPT_MAX_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_JUDGE_PROMPT_MAX_CHARS", "50000"))
+JUDGE_ANSWER_MAX_CHARS = int(os.environ.get("RAG_ANSWER_EVAL_JUDGE_ANSWER_MAX_CHARS", "24000"))
+JUDGE_MIN_OVERALL_SCORE = float(os.environ.get("RAG_ANSWER_EVAL_JUDGE_MIN_OVERALL_SCORE", "4.0"))
+
+# Progress heartbeat for long local LLM calls. This does not change generation policy;
+# it only prints liveness while requests.post is waiting for llama-server.
+PROGRESS_INTERVAL_SEC = int(os.environ.get("RAG_ANSWER_EVAL_PROGRESS_INTERVAL", "30"))
 
 
 # =============================================================================
@@ -126,6 +152,34 @@ def write_text(path: Path, text: str):
 def write_json(path: Path, data: Any):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def post_with_progress(url: str, payload: dict[str, Any], timeout: int, label: str):
+    """POST with periodic heartbeat so long llama.cpp generations are visible."""
+    started = time.time()
+
+    def _post():
+        return requests.post(url, json=payload, timeout=timeout)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_post)
+        last_print = started
+        while True:
+            try:
+                return future.result(timeout=max(PROGRESS_INTERVAL_SEC, 1))
+            except FutureTimeoutError:
+                if PROGRESS_INTERVAL_SEC <= 0:
+                    continue
+                now = time.time()
+                if now - last_print >= PROGRESS_INTERVAL_SEC:
+                    print(f"… {label}: still waiting for llama-server ({now - started:.0f}s)", flush=True)
+                    last_print = now
 
 
 def preview(text: str, n: int = 280) -> str:
@@ -162,7 +216,62 @@ def load_eval_cases(path: Path):
 # Prompt building through shared rag_core
 # =============================================================================
 
-def build_augmented_prompt(case: dict) -> str:
+def _retrieval_item_ref(item: dict[str, Any]) -> str:
+    p = item["payload"]
+    return f"{rc.file_name(p)}:#{p.get('chunk_index')}"
+
+
+def compact_retrieval_info(info: dict[str, Any], question: str) -> dict[str, Any]:
+    """Keep answer-eval retrieval diagnostics useful without storing chunk text."""
+    selected = info.get("selected", []) or []
+    candidates = info.get("candidates", []) or []
+    source_groups = info.get("source_groups", []) or []
+
+    selected_summary = []
+    for rank, item in enumerate(selected, start=1):
+        p = item["payload"]
+        selected_summary.append({
+            "rank": rank,
+            "ref": _retrieval_item_ref(item),
+            "file": rc.file_name(p),
+            "chunk_index": p.get("chunk_index"),
+            "dense_rank": item.get("dense_rank"),
+            "vector_score": item.get("vector_score"),
+            "meta_bonus": item.get("meta_bonus"),
+            "final_score": item.get("final_score"),
+            "decision": rc.payload_decision(p),
+            "delivery_value": rc.payload_delivery_value(p),
+            "criticality": rc.payload_criticality(p),
+            "role": rc.payload_role(p),
+        })
+
+    return {
+        "top_k": info.get("top_k"),
+        "pre_k": info.get("pre_k"),
+        "max_per_file": info.get("max_per_file"),
+        "neighbor_radius": info.get("neighbor_radius"),
+        "candidates_count": info.get("candidates_count", len(candidates)),
+        "selected_count": info.get("selected_count", len(selected)),
+        "source_groups_count": info.get("source_groups_count", len(source_groups)),
+        "context_chars": info.get("context_chars"),
+        "prompt_chars": info.get("prompt_chars"),
+        "answer_sections": info.get("answer_sections"),
+        "query_profile": rc.pretty_profile(rc.query_profile(question)),
+        "selected": selected_summary,
+        "source_groups": [
+            {
+                "group_rank": group.get("group_rank"),
+                "file_name": group.get("file_name"),
+                "selected_indices": group.get("selected_indices"),
+                "expanded_indices": group.get("expanded_indices"),
+                "best_final_score": group.get("best_final_score"),
+            }
+            for group in source_groups
+        ],
+    }
+
+
+def build_augmented_prompt(case: dict) -> tuple[str, dict[str, Any]]:
     """
     Build prompt through the current shared rag_core contract.
 
@@ -172,18 +281,18 @@ def build_augmented_prompt(case: dict) -> str:
     question = case["query"]
     top_k = int(case.get("top_k") or DEFAULT_TOP_K)
 
-    prompt, _info = rc.build_augmented_prompt(
+    prompt, info = rc.build_augmented_prompt(
         question=question,
         top_k=top_k,
     )
-    return prompt
+    return prompt, compact_retrieval_info(info, question=question)
 
 
 # =============================================================================
 # llama-server answer generation
 # =============================================================================
 
-def call_chat(prompt: str):
+def call_chat(prompt: str, label: str = "answer generation"):
     """
     Call llama-server with the default Qwen-instruct response behavior.
 
@@ -193,15 +302,9 @@ def call_chat(prompt: str):
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "max_tokens": ANSWER_MAX_TOKENS,
     }
-    if ANSWER_TEMPERATURE is not None:
-        payload["temperature"] = float(ANSWER_TEMPERATURE)
-    if ANSWER_TOP_P is not None:
-        payload["top_p"] = float(ANSWER_TOP_P)
-
     started = time.time()
-    r = requests.post(CHAT_URL, json=payload, timeout=ANSWER_TIMEOUT)
+    r = post_with_progress(CHAT_URL, payload, ANSWER_TIMEOUT, label)
     elapsed = time.time() - started
 
     try:
@@ -237,6 +340,348 @@ def call_chat(prompt: str):
         "raw_response": data,
     }
 
+
+
+# =============================================================================
+# Optional LLM judge
+# =============================================================================
+
+def clip_text_for_judge(text: str, max_chars: int) -> str:
+    text = text or ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return (
+        text[:head]
+        + f"\n\n...[judge input truncated: {len(text) - max_chars} chars omitted]...\n\n"
+        + text[-tail:]
+    )
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    """Best-effort JSON object extraction for local instruct models."""
+    raw = text or ""
+    parsed, _cleanup = rc.parse_qwen_final_answer(raw)
+    candidates = [parsed.strip(), raw.strip()]
+
+    for candidate in list(candidates):
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, flags=re.S | re.I)
+        candidates.extend(fenced)
+
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(candidate[start : end + 1])
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+
+    raise ValueError(f"Could not parse judge JSON from: {preview(raw, 1200)}")
+
+
+def clamp_score(value: Any) -> float | None:
+    try:
+        score = float(value)
+    except Exception:
+        return None
+    if score < 0:
+        return 0.0
+    if score > 5:
+        return 5.0
+    return score
+
+
+def build_llm_judge_prompt(prompt: str, answer: str, case: dict, checks: dict[str, Any]) -> str:
+    sections = rc.answer_sections() if hasattr(rc, "answer_sections") else []
+    case_requirements = {
+        "expected_answer_mode": case.get("expected_answer_mode"),
+        "required_answer_patterns": case.get("required_answer_patterns", []),
+        "forbidden_answer_patterns": case.get("forbidden_answer_patterns", []),
+        "min_citation_count": case.get("min_citation_count", MIN_CITATION_COUNT),
+        "required_sections": sections,
+    }
+    deterministic_summary = {
+        "passed": checks.get("passed"),
+        "failures": checks.get("failures", []),
+        "warnings": checks.get("warnings", []),
+        "metrics": checks.get("metrics", {}),
+    }
+
+    schema = {
+        "pass": True,
+        "overall_score": 0,
+        "groundedness_score": 0,
+        "citation_quality_score": 0,
+        "completeness_score": 0,
+        "abstention_quality_score": 0,
+        "contradiction_risk_score": 0,
+        "unsupported_claims": [],
+        "citation_errors": [],
+        "missing_important_points": [],
+        "overclaims": [],
+        "notes": "brief explanation",
+    }
+
+    return f"""You are a strict evaluator for a Retrieval-Augmented Generation answer.
+Return JSON only. Do not include markdown. Do not include chain-of-thought.
+
+Evaluate whether ANSWER_TO_EVALUATE is supported by RETRIEVED_CONTEXT_AND_TASK.
+Use only the retrieved context in the prompt, not outside knowledge.
+Do not reward plausible domain knowledge if it is not supported by the retrieved context.
+
+Scoring scale for all *_score fields: 0=bad, 5=excellent.
+- groundedness_score: factual claims are supported by retrieved context and cited.
+- citation_quality_score: citations point to relevant [S#] sources and are not decorative.
+- completeness_score: answer addresses the user question with the available evidence.
+- abstention_quality_score: answer clearly states unknowns when evidence is missing.
+- contradiction_risk_score: 0=no contradiction risk, 5=high contradiction/overclaim risk.
+- overall_score: holistic score considering the criteria above.
+
+Pass guideline:
+- pass=true only if overall_score >= {JUDGE_MIN_OVERALL_SCORE}, groundedness_score >= 4,
+  citation_quality_score >= 4, and contradiction_risk_score <= 2.
+- pass=false if there are serious unsupported claims, bad citations, or unsafe overclaims.
+
+Return exactly one JSON object matching this schema shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+CASE_ID:
+{case.get('id')}
+
+USER_QUERY:
+{case.get('query')}
+
+CASE_REQUIREMENTS_JSON:
+{json.dumps(case_requirements, ensure_ascii=False, indent=2)}
+
+DETERMINISTIC_CHECKS_JSON:
+{json.dumps(deterministic_summary, ensure_ascii=False, indent=2)}
+
+RETRIEVED_CONTEXT_AND_TASK:
+{clip_text_for_judge(prompt, JUDGE_PROMPT_MAX_CHARS)}
+
+ANSWER_TO_EVALUATE:
+{clip_text_for_judge(answer, JUDGE_ANSWER_MAX_CHARS)}
+"""
+
+
+def call_llm_judge(prompt: str, answer: str, case: dict, checks: dict[str, Any], label: str = "LLM judge") -> dict[str, Any]:
+    judge_prompt = build_llm_judge_prompt(prompt, answer, case, checks)
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict RAG evaluation judge. Return one JSON object only. "
+                    "Do not include markdown or chain-of-thought."
+                ),
+            },
+            {"role": "user", "content": judge_prompt},
+        ],
+        "stream": False,
+    }
+    started = time.time()
+    try:
+        r = post_with_progress(JUDGE_CHAT_URL, payload, JUDGE_TIMEOUT, label)
+        elapsed = time.time() - started
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw_text": r.text}
+        if r.status_code >= 400:
+            return {
+                "enabled": True,
+                "ok": False,
+                "passed": False,
+                "failure_type": "http_error",
+                "elapsed_sec": elapsed,
+                "url": JUDGE_CHAT_URL,
+                "http_status": r.status_code,
+                "error": (
+                    f"Judge request failed HTTP {r.status_code}: "
+                    f"{json.dumps(data, ensure_ascii=False)[:2000]}"
+                ),
+            }
+
+        msg = data.get("choices", [{}])[0].get("message", {})
+        raw_content = msg.get("content") or ""
+        try:
+            parsed = extract_json_object(raw_content)
+        except Exception as parse_error:
+            return {
+                "enabled": True,
+                "ok": False,
+                "passed": False,
+                "failure_type": "parse_error",
+                "elapsed_sec": elapsed,
+                "url": JUDGE_CHAT_URL,
+                "finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+                "usage": data.get("usage"),
+                "raw_content": raw_content,
+                "raw_preview": preview(raw_content, 2000),
+                "error": f"{type(parse_error).__name__}: {parse_error}",
+            }
+
+        scores = {
+            key: clamp_score(parsed.get(key))
+            for key in (
+                "overall_score",
+                "groundedness_score",
+                "citation_quality_score",
+                "completeness_score",
+                "abstention_quality_score",
+                "contradiction_risk_score",
+            )
+        }
+        for key, value in scores.items():
+            if value is not None:
+                parsed[key] = value
+
+        judge_pass = bool(parsed.get("pass"))
+        # If the model omitted pass, derive it from the stable numeric scores.
+        if "pass" not in parsed and scores.get("overall_score") is not None:
+            judge_pass = (
+                (scores.get("overall_score") or 0) >= JUDGE_MIN_OVERALL_SCORE
+                and (scores.get("groundedness_score") or 0) >= 4
+                and (scores.get("citation_quality_score") or 0) >= 4
+                and (scores.get("contradiction_risk_score") or 5) <= 2
+            )
+            parsed["pass"] = judge_pass
+
+        return {
+            "enabled": True,
+            "ok": True,
+            "passed": judge_pass,
+            "failure_type": None if judge_pass else "semantic_failure",
+            "elapsed_sec": elapsed,
+            "url": JUDGE_CHAT_URL,
+            "finish_reason": data.get("choices", [{}])[0].get("finish_reason"),
+            "usage": data.get("usage"),
+            "raw_content": raw_content,
+            "result": parsed,
+        }
+    except Exception as e:
+        return {
+            "enabled": True,
+            "ok": False,
+            "passed": False,
+            "failure_type": "request_error",
+            "elapsed_sec": time.time() - started,
+            "url": JUDGE_CHAT_URL,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+def add_llm_judge_metrics(checks: dict[str, Any], judge: dict[str, Any]):
+    metrics = checks.setdefault("metrics", {})
+    details = checks.setdefault("details", {})
+    details["llm_judge"] = judge
+
+    metrics["llm_judge_enabled"] = bool(judge.get("enabled"))
+    metrics["llm_judge_ok"] = bool(judge.get("ok"))
+    metrics["llm_judge_passed"] = bool(judge.get("passed")) if judge.get("ok") else False
+    metrics["llm_judge_elapsed_sec"] = judge.get("elapsed_sec")
+    metrics["llm_judge_failure_type"] = judge.get("failure_type")
+    metrics["llm_judge_parse_failed"] = judge.get("failure_type") == "parse_error"
+    metrics["llm_judge_semantic_failed"] = bool(judge.get("ok")) and not bool(judge.get("passed"))
+
+    result = judge.get("result") if isinstance(judge.get("result"), dict) else {}
+    for key in (
+        "overall_score",
+        "groundedness_score",
+        "citation_quality_score",
+        "completeness_score",
+        "abstention_quality_score",
+        "contradiction_risk_score",
+    ):
+        if key in result:
+            metrics[f"llm_judge_{key}"] = result.get(key)
+
+    if not judge.get("ok"):
+        failure_type = judge.get("failure_type") or "unknown"
+        checks.setdefault("warnings", []).append(
+            f"LLM judge call failed ({failure_type}): {judge.get('error')}"
+        )
+        if LLM_JUDGE_GATE:
+            checks.setdefault("failures", []).append(
+                f"LLM judge call failed ({failure_type}) while gate enabled: {judge.get('error')}"
+            )
+    elif not judge.get("passed"):
+        result = judge.get("result", {})
+        note = result.get("notes") if isinstance(result, dict) else None
+        msg = "LLM judge did not pass answer"
+        if note:
+            msg += f": {str(note)[:300]}"
+        if LLM_JUDGE_GATE:
+            checks.setdefault("failures", []).append(msg)
+        else:
+            checks.setdefault("warnings", []).append(msg)
+
+    checks["passed"] = not checks.get("failures")
+
+
+def aggregate_llm_judge(results: list[dict[str, Any]]) -> dict[str, Any]:
+    judges = [r.get("llm_judge") for r in results if isinstance(r.get("llm_judge"), dict)]
+    ok_judges = [j for j in judges if j.get("ok")]
+    failed_judges = [j for j in judges if not j.get("ok")]
+    semantic_failed_judges = [j for j in ok_judges if not j.get("passed")]
+    failure_types = Counter(str(j.get("failure_type") or "unknown") for j in failed_judges)
+
+    aggregate = {
+        "enabled": LLM_JUDGE_ENABLED,
+        "gate": LLM_JUDGE_GATE,
+        "cases_total": len(results),
+        "judged_cases": len(judges),
+        "ok_cases": len(ok_judges),
+        "failed_judge_calls": len(failed_judges),
+        "judge_call_success_rate": (len(ok_judges) / len(judges)) if judges else None,
+        "judge_passed_cases": sum(1 for j in ok_judges if j.get("passed")),
+        "judge_semantic_failed_cases": len(semantic_failed_judges),
+        "judge_semantic_pass_rate": (
+            sum(1 for j in ok_judges if j.get("passed")) / len(ok_judges)
+        ) if ok_judges else None,
+        "judge_end_to_end_pass_rate": (
+            sum(1 for j in ok_judges if j.get("passed")) / len(judges)
+        ) if judges else None,
+        "judge_failure_type_counts": dict(failure_types),
+        "judge_parse_error_cases": failure_types.get("parse_error", 0),
+        "judge_http_error_cases": failure_types.get("http_error", 0),
+        "judge_request_error_cases": failure_types.get("request_error", 0),
+    }
+
+    score_keys = (
+        "overall_score",
+        "groundedness_score",
+        "citation_quality_score",
+        "completeness_score",
+        "abstention_quality_score",
+        "contradiction_risk_score",
+    )
+    for key in score_keys:
+        values = []
+        for j in ok_judges:
+            result = j.get("result") if isinstance(j.get("result"), dict) else {}
+            value = result.get(key)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        if values:
+            aggregate[f"avg_{key}"] = sum(values) / len(values)
+            aggregate[f"min_{key}"] = min(values)
+            aggregate[f"max_{key}"] = max(values)
+    return aggregate
 
 
 # =============================================================================
@@ -388,6 +833,45 @@ def collect_regex_hits(text: str, patterns: list[str]):
     return hits
 
 
+def failure_category(failure: str) -> str:
+    """Stable, coarse failure taxonomy for comparing noisy local LLM runs.
+
+    The raw failure string stays human-readable and case-specific. This category
+    is for aggregation only, so regex/contract risk is not mixed with transport,
+    formatting, citation, or judge-infrastructure failures.
+    """
+    text = (failure or "").lower()
+    if "regex overclaim risk" in text or "forbidden answer pattern matched" in text:
+        return "regex_overclaim_risk"
+    if text.startswith("missing required section"):
+        return "format_missing_section"
+    if "too few source citations" in text or "no source citations" in text:
+        return "citation_contract"
+    if "generation truncated" in text or "generation loop detected" in text or "answer too short" in text:
+        return "generation_shape"
+    if "insufficient-evidence" in text or "uncertainty/abstention" in text:
+        return "abstention_contract"
+    if "visible reasoning leak" in text or "<think>" in text:
+        return "reasoning_leak"
+    if "classification metadata leaked" in text:
+        return "metadata_leak"
+    if "full local path leaked" in text:
+        return "path_leak"
+    if "raw /rag command" in text:
+        return "command_leak"
+    if "llm judge" in text and "parse" in text:
+        return "judge_parse_failure"
+    if "llm judge" in text:
+        return "judge_failure"
+    if text.startswith("missing required answer pattern"):
+        return "required_pattern_missing"
+    return "other"
+
+
+def failure_category_counts(failures: list[str]) -> dict[str, int]:
+    return dict(Counter(failure_category(f) for f in failures or []))
+
+
 def citation_ids(answer: str):
     """Extract source citation ids from bracketed RAG citations.
 
@@ -459,6 +943,7 @@ def is_format_or_generation_failure(failures: list[str], finish_reason: str | No
     )
     unsafe_markers = (
         "forbidden answer pattern matched",
+        "regex overclaim risk",
         "classification metadata leaked",
         "full local path leaked",
         "visible reasoning leak",
@@ -600,12 +1085,20 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_r
         ):
             failures.append(f"missing required answer pattern: {pattern}")
 
+    forbidden_pattern_hits = []
     for pattern in case.get("forbidden_answer_patterns", []):
         m = re.search(pattern, answer, flags=re.I | re.M) or re.search(
             pattern, contract_answer, flags=re.I | re.M
         )
         if m:
-            failures.append(f"forbidden answer pattern matched: {pattern}; match={m.group(0)[:160]!r}")
+            hit = {"pattern": pattern, "match": m.group(0)[:160], "pos": m.start()}
+            forbidden_pattern_hits.append(hit)
+            failures.append(
+                f"regex overclaim risk: forbidden answer pattern matched: {pattern}; "
+                f"match={m.group(0)[:160]!r}"
+            )
+
+    category_counts = failure_category_counts(failures)
 
     metrics = {
         "answer_chars": len(answer),
@@ -613,6 +1106,9 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_r
         "unique_citation_count": len(unique_citations),
         "unique_citations": [f"S{x}" for x in unique_citations],
         "section_count": sum(1 for ok in sections.values() if ok),
+        "forbidden_pattern_hit_count": len(forbidden_pattern_hits),
+        "regex_overclaim_risk_count": category_counts.get("regex_overclaim_risk", 0),
+        "failure_category_counts": category_counts,
     }
 
     details = {
@@ -621,6 +1117,8 @@ def run_answer_checks(answer: str, case: dict, cleanup: dict[str, Any], finish_r
         "path_hits": path_hits,
         "metadata_hits": metadata_hits,
         "loop_hits": loop_hits,
+        "forbidden_pattern_hits": forbidden_pattern_hits,
+        "failure_category_counts": category_counts,
         "finish_reason": finish_reason,
         "answer_cleanup": cleanup,
     }
@@ -650,18 +1148,24 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
         print(f"Notes: {case['notes']}")
 
     started = time.time()
-    prompt = build_augmented_prompt(case)
+    prompt, retrieval_info = build_augmented_prompt(case)
     prompt_elapsed = time.time() - started
 
     prompt_warning = None
     if re.search(r"/Users/|/home/|/mnt/|/tmp/", prompt):
         prompt_warning = "prompt contains full local path"
 
-    print(f"Prompt built: chars={len(prompt)} elapsed={prompt_elapsed:.2f}s")
+    print(
+        f"Prompt built: chars={len(prompt)} elapsed={prompt_elapsed:.2f}s "
+        f"context_chars={retrieval_info.get('context_chars')} "
+        f"selected={retrieval_info.get('selected_count')} "
+        f"sources={retrieval_info.get('source_groups_count')}"
+    )
     if prompt_warning:
         print(f"⚠️  {prompt_warning}")
 
-    response = call_chat(prompt)
+    print(f"Answer request: sending to llama-server (timeout={ANSWER_TIMEOUT}s)", flush=True)
+    response = call_chat(prompt, label=f"CASE {ordinal} answer")
     raw_answer = response["raw_answer"]
     answer = response["answer"]
     cleanup = response["answer_cleanup"]
@@ -687,7 +1191,7 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
         for repair_i in range(1, MAX_REPAIR_ATTEMPTS + 1):
             print(f"Repair attempt {repair_i}: format/generation-only failure detected")
             repair_prompt = build_repair_prompt(prompt, answer, checks["failures"])
-            repair_response = call_chat(repair_prompt)
+            repair_response = call_chat(repair_prompt, label=f"CASE {ordinal} repair {repair_i}")
             repair_answer = repair_response["answer"]
             repair_cleanup = repair_response["answer_cleanup"]
             repair_checks = run_answer_checks(
@@ -715,6 +1219,28 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
                 break
             print(f"Repair attempt {repair_i}: still failing")
 
+    llm_judge = None
+    if LLM_JUDGE_ENABLED:
+        print(f"LLM judge: enabled; sending to llama-server (timeout={JUDGE_TIMEOUT}s)", flush=True)
+        llm_judge = call_llm_judge(prompt, answer, case, checks, label=f"CASE {ordinal} LLM judge")
+        add_llm_judge_metrics(checks, llm_judge)
+        if llm_judge.get("ok"):
+            judge_result = llm_judge.get("result", {})
+            print(
+                "LLM judge: "
+                f"pass={llm_judge.get('passed')} "
+                f"overall={judge_result.get('overall_score')} "
+                f"groundedness={judge_result.get('groundedness_score')} "
+                f"citations={judge_result.get('citation_quality_score')} "
+                f"contradiction_risk={judge_result.get('contradiction_risk_score')} "
+                f"elapsed={llm_judge.get('elapsed_sec'):.2f}s"
+            )
+        else:
+            print(
+                f"LLM judge call failed: type={llm_judge.get('failure_type')} "
+                f"error={llm_judge.get('error')}"
+            )
+
     if prompt_warning:
         checks["warnings"].append(prompt_warning)
 
@@ -723,6 +1249,7 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
 
     if SAVE_PROMPTS:
         write_text(case_dir / "prompt.txt", prompt)
+    write_json(case_dir / "retrieval_metrics.json", retrieval_info)
     write_text(case_dir / "raw_answer.txt", raw_answer)
     write_text(case_dir / "answer.txt", answer)
 
@@ -735,6 +1262,7 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
         "warnings": checks["warnings"],
         "metrics": checks["metrics"],
         "details": checks["details"],
+        "retrieval_metrics": retrieval_info,
         "prompt_chars": len(prompt),
         "prompt_build_elapsed_sec": prompt_elapsed,
         "answer_elapsed_sec": response["elapsed_sec"],
@@ -743,6 +1271,7 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
         "answer_cleanup": cleanup,
         "repair_attempts": repair_attempts,
         "usage": response["usage"],
+        "llm_judge": llm_judge,
     }
     write_json(case_dir / "result.json", result)
 
@@ -762,15 +1291,137 @@ def eval_case(case: dict, run_dir: Path, ordinal: int):
     return result
 
 
+def aggregate_answer_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        return {}
+
+    total = len(results)
+
+    def avg(path: tuple[str, ...]) -> float | None:
+        vals = []
+        for result in results:
+            cur: Any = result
+            for key in path:
+                if not isinstance(cur, dict):
+                    cur = None
+                    break
+                cur = cur.get(key)
+            if isinstance(cur, (int, float)):
+                vals.append(float(cur))
+        return (sum(vals) / len(vals)) if vals else None
+
+    finish_reasons = Counter(str(r.get("finish_reason")) for r in results)
+    failure_kinds: Counter[str] = Counter()
+    failure_categories: Counter[str] = Counter()
+    warning_kinds: Counter[str] = Counter()
+    regex_overclaim_risk_cases = 0
+    judge_parse_failed_cases = 0
+    judge_semantic_failed_cases = 0
+    for result in results:
+        case_categories = Counter()
+        for failure in result.get("failures", []) or []:
+            failure_kinds[failure.split(":", 1)[0]] += 1
+            category = failure_category(failure)
+            failure_categories[category] += 1
+            case_categories[category] += 1
+        if case_categories.get("regex_overclaim_risk", 0) > 0:
+            regex_overclaim_risk_cases += 1
+        metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        if metrics.get("llm_judge_parse_failed"):
+            judge_parse_failed_cases += 1
+        if metrics.get("llm_judge_semantic_failed"):
+            judge_semantic_failed_cases += 1
+        for warning in result.get("warnings", []) or []:
+            warning_kinds[warning.split(":", 1)[0]] += 1
+
+    usage_totals: Counter[str] = Counter()
+    for result in results:
+        usage = result.get("usage") or {}
+        if isinstance(usage, dict):
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    usage_totals[key] += value
+
+    repaired = 0
+    repair_attempted = 0
+    for result in results:
+        attempts = result.get("repair_attempts") or []
+        if attempts:
+            repair_attempted += 1
+            if result.get("passed") and any(a.get("passed") for a in attempts):
+                repaired += 1
+
+    return {
+        "cases_total": total,
+        "passed": sum(1 for r in results if r.get("passed")),
+        "failed": sum(1 for r in results if not r.get("passed")),
+        "pass_rate": sum(1 for r in results if r.get("passed")) / total,
+        "answer_chars_avg": avg(("metrics", "answer_chars")),
+        "citation_count_avg": avg(("metrics", "citation_count")),
+        "unique_citation_count_avg": avg(("metrics", "unique_citation_count")),
+        "section_count_avg": avg(("metrics", "section_count")),
+        "prompt_chars_avg": avg(("prompt_chars",)),
+        "prompt_build_elapsed_sec_avg": avg(("prompt_build_elapsed_sec",)),
+        "answer_elapsed_sec_avg": avg(("answer_elapsed_sec",)),
+        "reasoning_content_chars_avg": avg(("reasoning_content_chars",)),
+        "retrieval_context_chars_avg": avg(("retrieval_metrics", "context_chars")),
+        "retrieval_selected_count_avg": avg(("retrieval_metrics", "selected_count")),
+        "retrieval_source_groups_count_avg": avg(("retrieval_metrics", "source_groups_count")),
+        "finish_reasons": dict(finish_reasons),
+        "failure_kinds": dict(failure_kinds),
+        "failure_category_counts": dict(failure_categories),
+        "regex_overclaim_risk_cases": regex_overclaim_risk_cases,
+        "judge_parse_failed_cases": judge_parse_failed_cases,
+        "judge_semantic_failed_cases": judge_semantic_failed_cases,
+        "warning_kinds": dict(warning_kinds),
+        "repair_attempted_cases": repair_attempted,
+        "repaired_cases": repaired,
+        "usage_totals": dict(usage_totals),
+    }
+
+
+
+
+def read_case_file(path: str | os.PathLike[str]) -> list[str]:
+    """Read newline-delimited case ids for expensive answer/judge reruns."""
+    case_path = Path(path).expanduser()
+    if not case_path.exists():
+        raise SystemExit(f"Case file not found: {case_path}")
+    out: list[str] = []
+    for raw in case_path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def selected_case_ids(args: argparse.Namespace) -> list[str]:
+    ids: list[str] = []
+    ids.extend(args.case_id or [])
+    for path in args.case_file or []:
+        ids.extend(read_case_file(path))
+    seen: set[str] = set()
+    out: list[str] = []
+    for case_id in ids:
+        if case_id not in seen:
+            seen.add(case_id)
+            out.append(case_id)
+    return out
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run answer contract / grounding hygiene eval for local RAG.")
+    parser = argparse.ArgumentParser(
+        description="Run answer contract / grounding hygiene eval for local RAG.",
+        epilog="Use repeated --case or --case-file to make LLM judge loops cheap after retrieval narrows the shortlist.",
+    )
     parser.add_argument(
         "eval_file",
         nargs="?",
         default=str(DEFAULT_EVAL_FILE),
         help=f"Path to eval queries JSON. Default: {DEFAULT_EVAL_FILE}",
     )
-    parser.add_argument("--case", dest="case_id", default=None, help="Run only one eval case id.")
+    parser.add_argument("--case", dest="case_id", action="append", help="Run one eval case id. Repeat for multiple cases.")
+    parser.add_argument("--case-file", action="append", help="Newline-delimited case ids; # comments and blanks are ignored.")
     parser.add_argument("--limit", type=int, default=0, help="Run only first N cases after filtering. 0 means all.")
     return parser.parse_args()
 
@@ -780,10 +1431,14 @@ def main():
     eval_file = Path(args.eval_file).expanduser()
 
     cases = load_eval_cases(eval_file)
-    if args.case_id:
-        cases = [c for c in cases if c.get("id") == args.case_id]
-        if not cases:
-            raise SystemExit(f"No eval case found with id={args.case_id!r}")
+    case_ids = selected_case_ids(args)
+    if case_ids:
+        wanted = set(case_ids)
+        cases = [c for c in cases if c.get("id") in wanted]
+        found = {str(c.get("id")) for c in cases}
+        missing = [case_id for case_id in case_ids if case_id not in found]
+        if missing:
+            raise SystemExit(f"No eval case(s) found: {missing}")
     if args.limit and args.limit > 0:
         cases = cases[: args.limit]
 
@@ -797,9 +1452,13 @@ def main():
     print(f"Eval file: {eval_file}")
     print(f"Run dir: {run_dir}")
     print(f"Chat URL: {CHAT_URL}")
-    print(f"Answer max tokens: {ANSWER_MAX_TOKENS}")
+    print("Answer generation params: omitted; llama-server launch controls max_tokens/temp/top_p/top_k/min_p/reasoning")
     print(f"Answer timeout: {ANSWER_TIMEOUT}")
     print(f"Repair on contract failure: {REPAIR_ON_CONTRACT_FAILURE}; attempts={MAX_REPAIR_ATTEMPTS}")
+    print(f"LLM judge enabled: {LLM_JUDGE_ENABLED}; gate={LLM_JUDGE_GATE}; url={JUDGE_CHAT_URL}")
+    print(f"Progress heartbeat interval: {PROGRESS_INTERVAL_SEC}s")
+    if LLM_JUDGE_ENABLED:
+        print("Judge generation params: omitted; same llama-server launch policy as answer generation")
     print("Qwen response handling: default server response parsed locally; no response-routing override is sent")
     print(f"Cases: {len(cases)}")
     print("Eval scope: answer contract / grounding hygiene; not full semantic faithfulness.")
@@ -828,22 +1487,35 @@ def main():
                 "details": {},
             }
         results.append(result)
+        append_jsonl(run_dir / "cases.jsonl", result)
 
     passed = sum(1 for r in results if r.get("passed"))
     failed = len(results) - passed
     failed_ids = [r["id"] for r in results if not r.get("passed")]
 
+    aggregate = aggregate_answer_metrics(results)
+
     summary = {
         "run_id": run_id,
         "eval_file": str(eval_file),
         "run_dir": str(run_dir),
+        "case_filter": case_ids,
         "chat_url": CHAT_URL,
         "qwen_answer_parsing": "default server response parsed locally; no response-routing override sent",
+        "llm_judge_enabled": LLM_JUDGE_ENABLED,
+        "llm_judge_gate": LLM_JUDGE_GATE,
+        "generation_settings": {
+            "eval_sent_generation_params": [],
+            "source_of_truth": "llama-server launch",
+            "server_launch_assumption": "eval_answer.py omits max_tokens/temp/top_p/top_k/min_p/reasoning; user's launch uses --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.0 --reasoning on --reasoning-budget -1 --n-predict 16384",
+        },
+        "llm_judge_aggregate": aggregate_llm_judge(results),
         "cases_total": len(results),
         "passed": passed,
         "failed": failed,
         "failed_ids": failed_ids,
-        "scope": "answer contract / grounding hygiene; not full semantic faithfulness",
+        "aggregate_metrics": aggregate,
+        "scope": "answer contract / grounding hygiene plus optional LLM judge; not a substitute for human review",
         "results": results,
     }
     write_json(run_dir / "summary.json", summary)
@@ -855,6 +1527,19 @@ def main():
     print(f"Cases total: {len(results)}")
     print(f"Passed: {passed}")
     print(f"Failed: {failed}")
+    if LLM_JUDGE_ENABLED:
+        judge_agg = summary["llm_judge_aggregate"]
+        print(
+            "LLM judge: "
+            f"ok={judge_agg.get('ok_cases')}/{judge_agg.get('judged_cases')} "
+            f"passed={judge_agg.get('judge_passed_cases')} "
+            f"avg_overall={judge_agg.get('avg_overall_score')}"
+        )
+    print("Aggregate metrics:")
+    for key, value in aggregate.items():
+        if key in {"failure_kinds", "warning_kinds"}:
+            continue
+        print(f"  {key}: {value}")
     if failed_ids:
         print()
         print("Failed case ids:")
