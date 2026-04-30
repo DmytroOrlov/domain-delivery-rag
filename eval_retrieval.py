@@ -40,14 +40,48 @@ Usage:
   python3 eval_retrieval.py blind_spot_warning_implications
   python3 eval_retrieval.py --case blind_spot_warning_implications
 
-Fast iteration pattern:
-  # Cheap sweep: retrieval-only, seconds instead of hours.
-  python3 eval_retrieval.py --compare --retrieval-only
+ADAS rerank-selection protocol:
+  The two commands below are the complete lightweight+expensive validation pair
+  for adas_embedded_vision. Keep them together: the first proves retrieval and
+  ranking cheaply; the second proves answer quality and LLM-judge behavior on
+  the same candidates. `baseline_full` is included as a reference, not as the
+  production recommendation candidate.
 
-  # Expensive sweep: answer + optional LLM judge only for shortlisted variants/cases.
-  python3 eval_retrieval.py --compare --answer --judge \
-    --variant production_default --variant baseline_full --variant no_metadata_rerank \
-    --case-file eval_runs/problem_cases.txt
+  These commands validate the current Qdrant collection. They do NOT rebuild it.
+  Re-ingest only when files, embeddings, chunking/ingest logic, metadata payload
+  schema, or collection name changed. Rerank/eval/proxy/comment-only changes do
+  not require re-ingest. If the collection already exists, eval can run without
+  the local `files/` directory; a fresh ingest cannot.
+
+  For reproducible eval, prefer RAG_DOMAIN_CONFIG=domains/adas_embedded_vision.json.
+  Avoid setting both RAG_DOMAIN and RAG_DOMAIN_CONFIG unless intentionally
+  diagnosing selector behavior. Use path env overrides only when deliberately
+  overriding the domain config.
+
+  # 1) Cheap sweep: seconds/minutes, no LLM answer generation.
+  python3 eval_retrieval.py --study adas_rerank_selection --retrieval-only \
+    --variant no_metadata_rerank \
+    --variant value_weights_only \
+    --variant baseline_full
+
+  # 2) Expensive sweep: retrieval + answer eval + LLM judge.
+  python3 eval_retrieval.py --study adas_rerank_selection --repeat 1 \
+    --variant no_metadata_rerank \
+    --variant value_weights_only \
+    --variant baseline_full
+
+  # 3) Optional stability pass: repeat only cases written by the expensive run.
+  # Prefer problem_cases.txt / safety_tail_cases.txt / paired_disagreement_cases.txt
+  # over repeat-3 across the whole corpus unless doing a final stability audit.
+  python3 eval_retrieval.py --study adas_rerank_selection --repeat 3 \
+    --variant no_metadata_rerank \
+    --variant value_weights_only \
+    --variant baseline_full \
+    --case-file eval_runs/.../problem_cases.txt
+
+Interpretation rules are embedded below in ADAS_RERANK_STUDY_RUNBOOK and copied
+into study_report.json; do not infer production policy from a single average
+score when safety-tail gates disagree.
 """
 
 from __future__ import annotations
@@ -213,6 +247,142 @@ HARD_GATE_POLICY = {
 # This ledger summarizes why the study harness exists and what prior runs taught us
 # since structured metrics were added. It is also copied into study_report.json so
 # future runs carry the assumptions/results that shaped the current decision rule.
+# This runbook is intentionally executable-code documentation: a new reviewer or
+# a future chat can answer "what do I run and how do I read it?" without a
+# README that drifts. It is copied into study_report.json for every study run.
+ADAS_RERANK_STUDY_RUNBOOK: dict[str, Any] = {
+    "purpose": "Select the ADAS rerank policy with paired retrieval, answer, and LLM-judge evidence.",
+    "why_two_main_commands": [
+        "The retrieval-only sweep is cheap and isolates ranking/retrieval changes from stochastic answer generation.",
+        "The answer+judge sweep is expensive and checks the same candidates for groundedness, citations, abstention quality, and overclaim risk.",
+        "Run retrieval-only first; only spend LLM time if candidates are technically valid and the expected sources are still reachable.",
+    ],
+    "collection_preconditions": {
+        "what_the_two_commands_do": "Validate the current Qdrant collection and current rerank/eval behavior; they do not rebuild or reingest data.",
+        "reingest_not_required_for": [
+            "rerank mode changes",
+            "eval-only changes",
+            "proxy footer/prompt changes",
+            "answer/judge reporting changes",
+            "comment/runbook-only changes",
+        ],
+        "reingest_required_for": [
+            "embedding model changes",
+            "input file additions/removals/content changes",
+            "chunking or ingestion logic changes",
+            "metadata schema/payload field changes",
+            "collection name changes",
+            "suspected stale or missing Qdrant collection",
+        ],
+        "files_directory_note": "A fresh ingest needs the files/ directory. Eval can run without local files/ if Qdrant already contains the expected collection and eval_source_map resolves source aliases.",
+    },
+    "environment_policy": {
+        "preferred_domain_selector": "Use RAG_DOMAIN_CONFIG=domains/adas_embedded_vision.json for reproducible eval runs.",
+        "avoid_setting_both": "Do not set both RAG_DOMAIN and RAG_DOMAIN_CONFIG for normal eval runs; set both only when intentionally diagnosing selector behavior.",
+        "path_overrides": "Prefer paths from the domain config. Use RAG_INPUT_DIR/RAG_EVAL_FILE/RAG_EVAL_SOURCE_MAP/RAG_EVAL_RUNS_DIR only when deliberately overriding config paths.",
+    },
+    "cost_policy": {
+        "normal_order": [
+            "retrieval-only sweep",
+            "repeat=1 answer+judge sweep",
+            "repeat=3 only on problem_cases/safety_tail/paired_disagreement cases",
+        ],
+        "do_not_start_with": "Do not start with repeat=3 across all cases unless doing a final stability audit; it is expensive and usually unnecessary for ordinary patch validation.",
+    },
+    "commands": {
+        "cheap_retrieval_sweep": [
+            "python3 eval_retrieval.py --study adas_rerank_selection --retrieval-only",
+            "  --variant no_metadata_rerank",
+            "  --variant value_weights_only",
+            "  --variant baseline_full",
+        ],
+        "full_answer_judge_sweep": [
+            "python3 eval_retrieval.py --study adas_rerank_selection --repeat 1",
+            "  --variant no_metadata_rerank",
+            "  --variant value_weights_only",
+            "  --variant baseline_full",
+        ],
+        "focused_stability_rerun": [
+            "python3 eval_retrieval.py --study adas_rerank_selection --repeat 3",
+            "  --variant no_metadata_rerank",
+            "  --variant value_weights_only",
+            "  --variant baseline_full",
+            "  --case-file eval_runs/.../problem_cases.txt",
+        ],
+    },
+    "candidate_roles": {
+        "no_metadata_rerank": "Current ADAS champion: dense retrieval, no metadata score. Also equals rerank.mode=disabled.",
+        "value_weights_only": "Measured challenger: keeps decision/delivery/criticality/role value weights, no query-profile hit boosts.",
+        "baseline_full": "Reference only: full metadata rerank. Keep it in studies to detect regressions; do not promote from one lucky run.",
+    },
+    "interpretation_rules": [
+        "Production candidates must pass hard_gates before average scores matter.",
+        "For safety-relevant ADAS, safety-tail slice failures override small overall-score or latency wins.",
+        "If no_metadata_rerank and value_weights_only are close, tie-break to no_metadata_rerank because it is simpler and less heuristic.",
+        "Promote value_weights_only only if it clears hard gates and wins paired cases by the configured practical margin without insufficient-evidence regressions.",
+        "Keep baseline_full as a reference even if one run looks good; historically it had worse retrieval and more overclaim/semantic failures.",
+        "Treat judge parse/request/http failures as judge infrastructure problems, not semantic answer failures.",
+        "Treat regex_overclaim_risk as a guardrail signal that needs inspection, not automatic proof of hallucination.",
+        "The ADAS result disables metadata rerank for ADAS only; it is not evidence that metadata/rerank layers are bad for every future domain.",
+        "For each new domain, rerun disabled vs value_weights_only vs full with that domain's own eval cases before enabling scoring layers.",
+    ],
+    "primary_metrics": [
+        "positive_expected_source_hit_at_5",
+        "positive_expected_source_mrr_selected",
+        "positive_selected_source_ndcg_at_5",
+        "answer_pass_rate",
+        "llm_judge_call_success_rate",
+        "llm_judge_semantic_pass_rate",
+        "regex_overclaim_risk_cases",
+        "insufficient_evidence slice semantic pass rate",
+        "paired_counts between no_metadata_rerank and value_weights_only",
+    ],
+}
+
+
+# The engine intentionally supports more layers than ADAS currently enables.
+# ADAS disabled metadata rerank because its evals did not prove those scoring
+# layers pay rent for safety-tail answer quality. Future domains should not copy
+# that setting blindly; use this guide to decide which capabilities to enable.
+DOMAIN_LAYER_DECISION_GUIDE: list[dict[str, Any]] = [
+    {
+        "layer": "metadata_extraction_and_schema",
+        "adas_state": "enabled",
+        "why_kept": "Useful for diagnostics, eval slices, document understanding, and future domain configs even when scoring is disabled.",
+        "enable_for_new_domain_when": "Always start enabled if the domain has stable labels you can validate at ingest.",
+        "measure_with": ["JSON/enum validity", "unknown/drop rates", "manual spot-check agreement", "debug usefulness"],
+    },
+    {
+        "layer": "value_weights_only_rerank",
+        "adas_state": "challenger",
+        "why_kept": "Sometimes improves answer quality, but did not consistently beat disabled on ADAS safety-tail cases.",
+        "enable_for_new_domain_when": "The domain has reliable value/decision/criticality labels and paired eval shows hard-gate-safe uplift over disabled.",
+        "measure_with": ["paired wins vs disabled", "hard gates", "slice metrics", "rank_delta_worsened", "answer/judge pass"],
+    },
+    {
+        "layer": "full_metadata_rerank",
+        "adas_state": "reference_only",
+        "why_kept": "Still useful as a regression/reference mode and may help domains where facets/layers/stages strongly predict relevance.",
+        "enable_for_new_domain_when": "Query profiles/facet/layer/stage hits improve retrieval and do not create overclaim regressions in answer/judge slices.",
+        "measure_with": ["hit@1/MRR/nDCG uplift", "rank_delta_improved vs worsened", "safety/no-answer slice failures", "tokens/latency"],
+    },
+    {
+        "layer": "query_profiles",
+        "adas_state": "lab_only",
+        "why_kept": "Encodes domain-specific recall hints; ADAS full mode did not prove stable enough for production scoring.",
+        "enable_for_new_domain_when": "The new domain has predictable trigger terms that pull missing evidence into top-k without hurting abstention/overclaim cases.",
+        "measure_with": ["profile hit count", "cases rescued", "cases worsened", "paired disagreement review"],
+    },
+    {
+        "layer": "dual_union_or_ensembles",
+        "adas_state": "retired",
+        "why_kept": "Not active; prior retrieval-only study showed no uplift over value_weights_only while adding complexity.",
+        "enable_for_new_domain_when": "Only reintroduce if two rankers show complementary wins: each rescues cases the other misses and the union does not add harmful context noise.",
+        "measure_with": ["unique rescued cases", "context token growth", "answer/judge regressions", "source overlap"],
+    },
+]
+
+
 RERANK_SELECTION_EVIDENCE_LEDGER: list[dict[str, Any]] = [
     {
         "hypothesis": "structured_metrics_required",
@@ -255,6 +425,55 @@ RERANK_SELECTION_EVIDENCE_LEDGER: list[dict[str, Any]] = [
         "decision": "Do not delete metadata capabilities; make domain configs choose which scoring layers pay rent.",
     },
 ]
+
+
+def print_study_runbook() -> None:
+    """Print the embedded ADAS study runbook without running eval.
+
+    This is intentionally part of the CLI so a new maintainer/chat can discover
+    the two required validation commands and the interpretation policy from code
+    rather than from stale external notes.
+    """
+    print("ADAS rerank-selection runbook")
+    print("=" * 31)
+    print(ADAS_RERANK_STUDY_RUNBOOK["purpose"])
+    print()
+    for name, command_lines in ADAS_RERANK_STUDY_RUNBOOK["commands"].items():
+        print(name + ":")
+        for line in command_lines:
+            print("  " + line)
+        print()
+    print("Collection/re-ingest policy:")
+    preconditions = ADAS_RERANK_STUDY_RUNBOOK.get("collection_preconditions", {})
+    print(f"  - {preconditions.get('what_the_two_commands_do', '')}")
+    print("  - Re-ingest is NOT required for:")
+    for item in preconditions.get("reingest_not_required_for", []):
+        print(f"    * {item}")
+    print("  - Re-ingest IS required for:")
+    for item in preconditions.get("reingest_required_for", []):
+        print(f"    * {item}")
+    if preconditions.get("files_directory_note"):
+        print(f"  - {preconditions['files_directory_note']}")
+    print()
+    print("Environment policy:")
+    env_policy = ADAS_RERANK_STUDY_RUNBOOK.get("environment_policy", {})
+    for value in env_policy.values():
+        print(f"  - {value}")
+    print()
+    print("Cost policy:")
+    cost_policy = ADAS_RERANK_STUDY_RUNBOOK.get("cost_policy", {})
+    for step in cost_policy.get("normal_order", []):
+        print(f"  - {step}")
+    if cost_policy.get("do_not_start_with"):
+        print(f"  - {cost_policy['do_not_start_with']}")
+    print()
+    print("Interpretation rules:")
+    for rule in ADAS_RERANK_STUDY_RUNBOOK["interpretation_rules"]:
+        print(f"  - {rule}")
+    print()
+    print("Domain layer decision guide:")
+    for item in DOMAIN_LAYER_DECISION_GUIDE:
+        print(f"  - {item['layer']}: ADAS={item['adas_state']}; new domains: {item['enable_for_new_domain_when']}")
 
 
 def base_name(path_or_name: str) -> str:
@@ -1383,6 +1602,8 @@ def build_study_report(comparison: dict[str, Any]) -> dict[str, Any]:
             "tie_breaker": "favor disabled/no_metadata_rerank for safety-relevant ADAS unless value_weights_only shows decisive paired uplift without safety-tail regressions",
             "hard_gate_policy": HARD_GATE_POLICY,
         },
+        "runbook": ADAS_RERANK_STUDY_RUNBOOK,
+        "domain_layer_decision_guide": DOMAIN_LAYER_DECISION_GUIDE,
         "evidence_ledger": RERANK_SELECTION_EVIDENCE_LEDGER,
         "candidate_summaries": candidate_summaries,
         "hard_gates": hard_gates,
@@ -1403,9 +1624,56 @@ def write_study_report_files(run_root: Path, study_report: dict[str, Any]) -> No
         "",
         study_report.get("recommendation_reason") or "",
         "",
-        "## Paired counts",
-        "",
     ]
+    runbook = study_report.get("runbook") or {}
+    if runbook:
+        lines += ["## What to run", ""]
+        for name, command_lines in (runbook.get("commands") or {}).items():
+            lines.append(f"### {name}")
+            lines.append("")
+            lines.append("```bash")
+            lines.extend(command_lines)
+            lines.append("```")
+            lines.append("")
+        preconditions = runbook.get("collection_preconditions") or {}
+        if preconditions:
+            lines += ["## Collection and re-ingest policy", ""]
+            if preconditions.get("what_the_two_commands_do"):
+                lines.append(f"- {preconditions['what_the_two_commands_do']}")
+            if preconditions.get("reingest_not_required_for"):
+                lines.append("- Re-ingest is NOT required for: " + ", ".join(preconditions["reingest_not_required_for"]))
+            if preconditions.get("reingest_required_for"):
+                lines.append("- Re-ingest IS required for: " + ", ".join(preconditions["reingest_required_for"]))
+            if preconditions.get("files_directory_note"):
+                lines.append(f"- {preconditions['files_directory_note']}")
+            lines.append("")
+        env_policy = runbook.get("environment_policy") or {}
+        if env_policy:
+            lines += ["## Environment policy", ""]
+            for value in env_policy.values():
+                lines.append(f"- {value}")
+            lines.append("")
+        cost_policy = runbook.get("cost_policy") or {}
+        if cost_policy:
+            lines += ["## Cost policy", ""]
+            for step in cost_policy.get("normal_order") or []:
+                lines.append(f"- {step}")
+            if cost_policy.get("do_not_start_with"):
+                lines.append(f"- {cost_policy['do_not_start_with']}")
+            lines.append("")
+        lines += ["## How to interpret", ""]
+        for rule in runbook.get("interpretation_rules") or []:
+            lines.append(f"- {rule}")
+        lines.append("")
+
+    layer_guide = study_report.get("domain_layer_decision_guide") or []
+    if layer_guide:
+        lines += ["## Domain layer decision guide", ""]
+        for item in layer_guide:
+            lines.append(f"- {item.get('layer')}: ADAS state={item.get('adas_state')}; enable for new domains when {item.get('enable_for_new_domain_when')}")
+        lines.append("")
+
+    lines += ["", "## Paired counts", ""]
     for key, value in sorted((study_report.get("paired_counts") or {}).items()):
         lines.append(f"- {key}: {value}")
     lines += ["", "## Hard gates", ""]
@@ -1419,31 +1687,38 @@ def write_study_report_files(run_root: Path, study_report: dict[str, Any]) -> No
 
 def write_recommended_next_steps(run_root: Path, ranking_rows: list[dict[str, Any]], problem_cases: list[str], answer_enabled: bool) -> None:
     top_variants = [row["variant"] for row in ranking_rows[:3] if row.get("variant")]
+    canonical_variants = ["no_metadata_rerank", "value_weights_only", "baseline_full"]
+    canonical_args = " ".join(f"--variant {name}" for name in canonical_variants)
     lines = [
         "Recommended next commands",
         "=========================",
         "",
-        "Cheap sweep, safe to run often:",
-        "  python3 eval_retrieval.py --compare --retrieval-only",
+        "Canonical ADAS rerank-selection protocol:",
+        f"  python3 eval_retrieval.py --study adas_rerank_selection --retrieval-only {canonical_args}",
+        f"  python3 eval_retrieval.py --study adas_rerank_selection --repeat 1 {canonical_args}",
+        "",
+        "Interpretation:",
+        "  - no_metadata_rerank is the current ADAS champion and tie-breaker.",
+        "  - value_weights_only must beat it on paired/safety-tail metrics before promotion.",
+        "  - baseline_full is a reference, not the production recommendation candidate.",
         "",
     ]
     if top_variants:
         variant_args = " ".join(f"--variant {name}" for name in top_variants)
         lines += [
-            "Expensive shortlist only:",
+            "Generic compare shortlist from this run:",
             f"  python3 eval_retrieval.py --compare --answer --judge {variant_args}",
             "",
         ]
     if problem_cases:
-        variant_args = " ".join(f"--variant {name}" for name in top_variants[:2]) if top_variants else ""
         lines += [
-            "Problem-case loop only:",
-            f"  python3 eval_retrieval.py --compare --answer --judge {variant_args} --case-file {run_root / 'problem_cases.txt'}",
+            "Focused stability loop for this run's problem cases:",
+            f"  python3 eval_retrieval.py --study adas_rerank_selection --repeat 3 {canonical_args} --case-file {run_root / 'problem_cases.txt'}",
             "",
         ]
     if not answer_enabled:
         lines += [
-            "This run was retrieval-only. Use --answer --judge only after retrieval narrows the shortlist.",
+            "This run was retrieval-only. Run the canonical expensive sweep before making answer-quality decisions.",
             "",
         ]
     (run_root / "recommended_next_commands.txt").write_text("\n".join(lines), encoding="utf-8")
@@ -1864,10 +2139,17 @@ def run_retrieval_eval(case_ids: list[str] | None = None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run retrieval eval or built-in ablation comparison for local RAG.",
+        description="Run retrieval eval or built-in ablation/study comparison for local RAG.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Fast loop: run --compare --retrieval-only across many variants first; "
-            "then rerun --answer --judge only for the top variants and --case-file problem_cases.txt."
+            "ADAS canonical validation pair:\n"
+            "  python3 eval_retrieval.py --study adas_rerank_selection --retrieval-only "
+            "--variant no_metadata_rerank --variant value_weights_only --variant baseline_full\n"
+            "  python3 eval_retrieval.py --study adas_rerank_selection --repeat 1 "
+            "--variant no_metadata_rerank --variant value_weights_only --variant baseline_full\n\n"
+            "Interpretation: no_metadata_rerank is the ADAS champion/tie-breaker; "
+            "value_weights_only is the challenger; baseline_full is reference only. "
+            "Use --print-study-runbook for the full embedded protocol and new-domain layer guide."
         ),
     )
     parser.add_argument("case_pos", nargs="?", help="Optional single case id, kept for backward compatibility.")
@@ -1883,6 +2165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-going", action="store_true", help=argparse.SUPPRESS)  # Backward compatible no-op; compare now keeps going by default.
     parser.add_argument("--fail-fast", action="store_true", help="With --compare, stop after the first child eval exits non-zero.")
     parser.add_argument("--list-variants", action="store_true", help="List built-in ablation variants and exit.")
+    parser.add_argument("--print-study-runbook", action="store_true", help="Print the embedded ADAS study protocol and new-domain layer guide, then exit.")
     args = parser.parse_args()
     if args.study:
         args.compare = True
@@ -1902,6 +2185,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.print_study_runbook:
+        print_study_runbook()
+        return
     if args.list_variants:
         for variant in ABLATION_VARIANTS:
             print(f"{variant['name']}: {variant['description']}")
