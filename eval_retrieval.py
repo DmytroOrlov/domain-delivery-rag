@@ -83,7 +83,7 @@ RUNS_DIR = Path(
 ABLATION_VARIANTS: list[dict[str, Any]] = [
     {
         "name": "production_default",
-        "description": "Active domain config as production runs it. For ADAS this is rerank.mode=value_weights_only.",
+        "description": "Active domain config as production runs it. Current ADAS champion is conservative rerank.mode=disabled; value_weights_only remains a measured challenger.",
         "env": {},
     },
     {
@@ -213,6 +213,53 @@ HARD_GATE_POLICY = {
     "regex_overclaim_risk_max": 0,
     "insufficient_evidence_semantic_pass_min": 1.0,
 }
+
+# Keep the research trail in executable code rather than in a README that drifts.
+# This ledger summarizes why the study harness exists and what prior runs taught us
+# since structured metrics were added. It is also copied into study_report.json so
+# future runs carry the assumptions/results that shaped the current decision rule.
+RERANK_SELECTION_EVIDENCE_LEDGER: list[dict[str, Any]] = [
+    {
+        "hypothesis": "structured_metrics_required",
+        "result": "Persisted retrieval/answer JSONL and summary metrics made rerank changes measurable instead of anecdotal.",
+        "decision": "Keep structured eval artifacts as the baseline observability layer.",
+    },
+    {
+        "hypothesis": "llm_judge_adds_useful_signal",
+        "result": "LLM judge exposed unsupported inference and abstention-quality regressions that deterministic checks alone missed.",
+        "decision": "Use judge as an advisory/gated semantic layer, but separate judge infrastructure failures from semantic failures.",
+    },
+    {
+        "hypothesis": "eval_should_control_generation_policy",
+        "result": "Eval-side max_tokens/temp/top_p defaults conflicted with the llama-server launch policy and caused misleading budget debates.",
+        "decision": "Do not send generation overrides from eval; the server launch is the source of truth.",
+    },
+    {
+        "hypothesis": "full_metadata_rerank_improves_adas",
+        "result": "Full rerank repeatedly worsened rank deltas and produced more safety-tail semantic failures than simpler candidates.",
+        "decision": "Keep full rerank as a lab/reference mode, not as the ADAS production default.",
+    },
+    {
+        "hypothesis": "value_weights_only_keeps_the_useful_metadata_signal",
+        "result": "Value-only rerank sometimes won focused runs, but was unstable on insufficient-evidence, regulatory, deployment, and latency slices.",
+        "decision": "Keep value_weights_only as a challenger/study variant; require decisive paired uplift before promoting it.",
+    },
+    {
+        "hypothesis": "disabled_rerank_is_too_primitive",
+        "result": "Disabled/no_metadata_rerank most consistently cleared hard gates and avoided metadata-induced over-inference on ADAS safety-tail cases.",
+        "decision": "Use disabled as the conservative ADAS champion unless a challenger beats it on paired safety-tail metrics.",
+    },
+    {
+        "hypothesis": "dual_union_can_combine_disabled_and_value_only",
+        "result": "Retrieval-only study showed dual_union matched value_weights_only without clear uplift, adding context complexity without proven benefit.",
+        "decision": "Keep dual_union experimental and exclude it from expensive default sweeps unless retrieval disagreement suggests value.",
+    },
+    {
+        "hypothesis": "metadata_system_should_be_deleted_if_rerank_is_disabled",
+        "result": "ADAS evidence only argues against metadata scoring in the hot path, not against metadata extraction/schema for diagnostics or generic domains.",
+        "decision": "Do not delete metadata capabilities; make domain configs choose which scoring layers pay rent.",
+    },
+]
 
 
 def base_name(path_or_name: str) -> str:
@@ -1045,19 +1092,115 @@ def rank_variants(comparison: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_problem_case_file(run_root: Path, comparison: dict[str, Any]) -> list[str]:
-    """Write cases worth rerunning in expensive answer+judge mode."""
-    problem_ids: set[str] = set()
+def _infer_answer_failure_categories(result: dict[str, Any]) -> set[str]:
+    """Best-effort per-case failure categories for rerun selection.
+
+    eval_answer.py already writes aggregate category counts. For case files we
+    need case ids, so this helper reads the per-case result and tolerates older
+    runs that may not yet contain metrics.failure_category_counts.
+    """
+    categories: set[str] = set()
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    counts = metrics.get("failure_category_counts") if isinstance(metrics.get("failure_category_counts"), dict) else {}
+    categories.update(str(k) for k, v in counts.items() if v)
+    for failure in result.get("failures") or []:
+        text = str(failure).lower()
+        if "forbidden_answer_pattern" in text or "overclaim" in text:
+            categories.add("regex_overclaim_risk")
+        elif "citation" in text:
+            categories.add("citation_contract")
+        elif "missing_required_section" in text or "required section" in text:
+            categories.add("answer_contract")
+        elif text:
+            categories.add("deterministic_failure")
+    return categories
+
+
+def _collect_answer_problem_sets(comparison: dict[str, Any]) -> dict[str, set[str]]:
+    """Collect problem case ids by reason from answer/judge artifacts."""
+    out: dict[str, set[str]] = {
+        "deterministic_failed": set(),
+        "regex_overclaim_risk": set(),
+        "judge_infra_failed": set(),
+        "judge_semantic_failed": set(),
+        "safety_tail": set(),
+    }
     for variant in comparison.get("variants", []) or []:
-        for stage in ("retrieval", "answer"):
-            metrics = ((variant.get(stage) or {}).get("metrics") or {})
-            for case_id in metrics.get("failed_ids") or []:
-                if case_id:
-                    problem_ids.add(str(case_id))
-    out = sorted(problem_ids)
-    if out:
-        (run_root / "problem_cases.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
+        for result in _load_answer_results_for_variant(variant):
+            case_id = str(result.get("id") or "").strip()
+            if not case_id:
+                continue
+            slices = set(classify_case_slices(result))
+            if slices & {"insufficient_evidence", "regulatory_scope", "validation_test", "deployment_runtime", "failure_degraded_mode"}:
+                out["safety_tail"].add(case_id)
+            summary = _case_success_from_answer_result(result)
+            if not summary["deterministic_pass"]:
+                out["deterministic_failed"].add(case_id)
+            categories = _infer_answer_failure_categories(result)
+            if "regex_overclaim_risk" in categories:
+                out["regex_overclaim_risk"].add(case_id)
+            if summary["judge_enabled"] and not summary["judge_ok"]:
+                out["judge_infra_failed"].add(case_id)
+            if summary["judge_enabled"] and summary["judge_ok"] and not summary["judge_passed"]:
+                out["judge_semantic_failed"].add(case_id)
     return out
+
+
+def _collect_paired_disagreement_cases(study_report: dict[str, Any] | None) -> set[str]:
+    """Cases where primary A/B candidates disagree or one fails end-to-end."""
+    if not study_report:
+        return set()
+    out: set[str] = set()
+    for row in study_report.get("paired_rows") or []:
+        case_id = str(row.get("case_id") or "").strip()
+        if not case_id:
+            continue
+        a_pass = bool(row.get(f"{STUDY_PRIMARY_A}_end_to_end_pass"))
+        b_pass = bool(row.get(f"{STUDY_PRIMARY_B}_end_to_end_pass"))
+        if row.get("winner") != "tie" or a_pass != b_pass:
+            out.add(case_id)
+    return out
+
+
+def _write_case_id_file(path: Path, case_ids: set[str]) -> list[str]:
+    out = sorted(case_ids)
+    if out:
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return out
+
+
+def write_problem_case_files(run_root: Path, comparison: dict[str, Any], study_report: dict[str, Any] | None = None) -> dict[str, list[str]]:
+    """Write targeted rerun case files.
+
+    `problem_cases.txt` is intentionally broad: it is the expensive rerun set,
+    not just deterministic failures. Prior runs showed that semantic judge
+    failures and paired disagreements were the cases that actually changed the
+    rerank decision, so they must be included.
+    """
+    reason_sets = _collect_answer_problem_sets(comparison)
+
+    retrieval_failed: set[str] = set()
+    for variant in comparison.get("variants", []) or []:
+        metrics = ((variant.get("retrieval") or {}).get("metrics") or {})
+        for case_id in metrics.get("failed_ids") or []:
+            if case_id:
+                retrieval_failed.add(str(case_id))
+    reason_sets["retrieval_failed"] = retrieval_failed
+    reason_sets["paired_disagreement"] = _collect_paired_disagreement_cases(study_report)
+
+    semantic_problem_cases = set(reason_sets["judge_semantic_failed"]) | set(reason_sets["judge_infra_failed"])
+    paired_disagreement_cases = set(reason_sets["paired_disagreement"])
+    safety_tail_cases = set(reason_sets["safety_tail"])
+    all_problem_cases = set().union(*reason_sets.values()) if reason_sets else set()
+
+    files = {
+        "problem_cases": _write_case_id_file(run_root / "problem_cases.txt", all_problem_cases),
+        "semantic_problem_cases": _write_case_id_file(run_root / "semantic_problem_cases.txt", semantic_problem_cases),
+        "paired_disagreement_cases": _write_case_id_file(run_root / "paired_disagreement_cases.txt", paired_disagreement_cases),
+        "safety_tail_cases": _write_case_id_file(run_root / "safety_tail_cases.txt", safety_tail_cases),
+    }
+    files["by_reason"] = {key: sorted(value) for key, value in sorted(reason_sets.items())}  # type: ignore[assignment]
+    return files
 
 
 
@@ -1245,6 +1388,7 @@ def build_study_report(comparison: dict[str, Any]) -> dict[str, Any]:
             "tie_breaker": "favor disabled/no_metadata_rerank for safety-relevant ADAS unless value_weights_only shows decisive paired uplift without safety-tail regressions",
             "hard_gate_policy": HARD_GATE_POLICY,
         },
+        "evidence_ledger": RERANK_SELECTION_EVIDENCE_LEDGER,
         "candidate_summaries": candidate_summaries,
         "hard_gates": hard_gates,
         "slice_metrics": slice_metrics,
@@ -1484,15 +1628,18 @@ def run_compare(args: argparse.Namespace) -> None:
     comparison["completed_variants"] = len(comparison["variants"])
     comparison["variant_child_failure_count"] = len(child_failures)
     ranking_rows = rank_variants(comparison)
-    problem_cases = write_problem_case_file(run_root, comparison)
     comparison["variant_ranking"] = ranking_rows
-    comparison["problem_cases"] = problem_cases
+    study_report = None
     if args.study:
         study_report = build_study_report(comparison)
         comparison["study_report_path"] = str(run_root / "study_report.json")
         comparison["study_recommendation"] = study_report.get("recommendation")
         comparison["study_recommendation_reason"] = study_report.get("recommendation_reason")
         write_study_report_files(run_root, study_report)
+    problem_case_files = write_problem_case_files(run_root, comparison, study_report)
+    problem_cases = problem_case_files.get("problem_cases", [])
+    comparison["problem_cases"] = problem_cases
+    comparison["problem_case_files"] = problem_case_files
     write_recommended_next_steps(run_root, ranking_rows, problem_cases, answer_enabled=bool(answer_rows))
     write_json(run_root / "comparison.json", comparison)
 
@@ -1518,7 +1665,7 @@ def run_compare(args: argparse.Namespace) -> None:
         md_parts += ["", markdown_table(answer_rows, ANSWER_COMPARE_KEYS + ["subprocess_failed"], "Answer / LLM judge")]
     if problem_cases:
         md_parts += ["", "## Problem cases for the next expensive loop", ""]
-        md_parts.append("These failed in at least one retrieval/answer child run and were written to `problem_cases.txt`.")
+        md_parts.append("These include retrieval/deterministic failures, judge semantic or infrastructure failures, regex overclaim risks, and paired A/B disagreements; they were written to `problem_cases.txt`.")
         md_parts.append("")
         for case_id in problem_cases:
             md_parts.append(f"- {case_id}")
@@ -1538,6 +1685,10 @@ def run_compare(args: argparse.Namespace) -> None:
     print(f"- {run_root / 'recommended_next_commands.txt'}")
     if problem_cases:
         print(f"- {run_root / 'problem_cases.txt'}")
+        for extra_name in ("semantic_problem_cases.txt", "paired_disagreement_cases.txt", "safety_tail_cases.txt"):
+            extra_path = run_root / extra_name
+            if extra_path.exists():
+                print(f"- {extra_path}")
     if child_failures:
         print(f"Child eval non-zero exits recorded: {len(child_failures)}")
         print("These are kept as metrics; compare mode did not discard the sweep.")

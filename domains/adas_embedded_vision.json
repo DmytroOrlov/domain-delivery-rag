@@ -248,7 +248,7 @@
     }
   ],
   "rerank": {
-    "mode": "value_weights_only",
+    "mode": "disabled",
     "clamp": [
       -0.045,
       0.05
