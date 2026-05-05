@@ -69,7 +69,7 @@ import rag_core as rc
 # =============================================================================
 
 LLAMA_URL = os.environ.get("RAG_LLAMA_URL", "http://127.0.0.1:8080").rstrip("/")
-PROXY_HOST = os.environ.get("RAG_PROXY_HOST", "127.0.0.1")
+PROXY_HOST = os.environ.get("RAG_PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("RAG_PROXY_PORT", "8088"))
 
 # Default: active rewrite. Use RAG_PROXY_DRY_RUN=1 to only detect/log /rag.
