@@ -1,7 +1,7 @@
 {
   "id": "adas_embedded_vision",
   "display_name": "ADAS Embedded Vision Delivery RAG",
-  "collection": "rag_v1_chunks_2",
+  "collection": "rag_v1_chunks_3",
   "input_dir": "files",
   "failure_dir": "metadata_failures",
   "eval_file": "evals/adas_embedded_vision/eval_queries.json",

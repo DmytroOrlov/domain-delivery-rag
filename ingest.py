@@ -1,8 +1,11 @@
+import argparse
 import hashlib
 import json
 import os
 import re
+import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -32,10 +35,29 @@ from domain_config import load_domain_config
 #   - scalable enough for v1: Qdrant payload indexes, batch metadata extraction
 #   - observable by default: stdout shows chunk stats, batch plan, retries, summary
 #
-# Important:
-#   - This script still does full re-ingest by design.
-#   - Incremental ingest / cache / manifest are intentionally not implemented yet.
-#   - Chunks with the active domain decision value configured as drop are not indexed by default.
+# Important operator contract:
+#   - This script is now an incremental Qdrant-backed sync, not a full rebuild.
+#   - It never deletes the Qdrant collection. Operators delete collections manually
+#     when they intentionally want a clean reindex.
+#   - It creates the collection if it is missing.
+#   - It stores no persistent local manifest. Indexed document state lives in
+#     Qdrant payload via document_checksum.
+#   - document_checksum is sha256(raw file bytes). Rename keeps the same checksum;
+#     ingest updates source_file_path/source_file_name and skips expensive work.
+#   - File path is not document identity. If bytes change at the same path, the
+#     new checksum is indexed and the old checksum is removed by the same
+#     missing-checksum prune used for deleted files.
+#   - Chunks for checksums no longer present in INPUT_DIR are pruned, but large prune
+#     operations require --force-large-prune. Empty scans hard-fail and delete
+#     nothing.
+#   - Transient in-progress marker files are allowed only for crash recovery. On
+#     startup, stale markers cause partial Qdrant points for that checksum to be
+#     removed, then the marker is deleted. These markers are not a source of truth.
+#   - There is intentionally no ingest_fingerprint. If embedding model/vector dim,
+#     chunking, metadata schema/extraction prompt, payload contract, or domain
+#     semantics change, delete the collection manually and run ingest.py again.
+#   - Chunks with the active domain decision value configured as drop are not
+#     indexed by default.
 # =============================================================================
 
 
@@ -43,6 +65,7 @@ DOMAIN = load_domain_config()
 
 INPUT_DIR = os.path.expanduser(os.environ.get("RAG_INPUT_DIR", DOMAIN.input_dir))
 FAILURE_DIR = os.path.expanduser(os.environ.get("RAG_FAILURE_DIR", DOMAIN.failure_dir))
+IN_PROGRESS_DIR = os.path.expanduser(os.environ.get("RAG_INGEST_IN_PROGRESS_DIR", os.path.join(FAILURE_DIR, "ingest_in_progress")))
 
 EMBED_URL = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
 CHAT_URL = os.environ.get("RAG_CHAT_URL", "http://127.0.0.1:8080/v1/chat/completions")
@@ -61,6 +84,23 @@ METADATA_TARGET_BATCH_SIZE = int(os.environ.get("RAG_METADATA_TARGET_BATCH_SIZE"
 # METADATA_MAX_BATCH_SIZE. Retry splits can also increase the actual request count.
 METADATA_TARGET_MAX_INITIAL_BATCHES = int(os.environ.get("RAG_METADATA_TARGET_MAX_INITIAL_BATCHES", "3"))
 METADATA_MAX_BATCH_SIZE = int(os.environ.get("RAG_METADATA_MAX_BATCH_SIZE", "25"))
+
+# Metadata extraction stays strict: invalid enum values are not silently repaired
+# or downgraded to unknown. LLM extraction is stochastic enough that a protocol
+# violation can disappear on a fresh request, so retry the same request before
+# falling back to batch splitting or failing loudly. These are new HTTP chat
+# completion calls; llama-server does not receive the previous invalid response
+# as conversation history.
+METADATA_BATCH_VALIDATION_RETRIES = int(os.environ.get("RAG_METADATA_BATCH_VALIDATION_RETRIES", "1"))
+METADATA_SINGLE_VALIDATION_RETRIES = int(os.environ.get("RAG_METADATA_SINGLE_VALIDATION_RETRIES", "1"))
+
+STRICT_METADATA_RETRY_NOTE = """
+
+Strict schema instruction:
+Return compact JSON only. Use only the exact enum values listed above.
+Do not invent enum values. If unsure, use unknown/default where allowed.
+Return exactly one row per expected chunk_index and no extra rows.
+"""
 
 # Default: do NOT index chunks classified as drop.
 # For debugging, run:
@@ -300,6 +340,11 @@ STATS = {
     "chunks_total": 0,
     "points_total": 0,
     "dropped_chunks_skipped": 0,
+    "files_added": 0,
+    "files_skipped": 0,
+    "files_path_updated": 0,
+    "files_pruned": 0,
+    "stale_in_progress_cleaned": 0,
 }
 
 
@@ -334,6 +379,42 @@ def preview(text: str, n: int = 160):
     if len(text) <= n:
         return text
     return text[:n] + "..."
+
+
+def compact_metadata_error(exc: Exception, max_len: int = 220) -> str:
+    """Return a one-line, operator-readable metadata protocol error.
+
+    Full model output and batch context are still written under metadata_failures/.
+    Console logs should answer "why are we retrying?" without dumping allowed
+    enum lists or raw JSON. Prefer the root validation cause when available.
+    """
+    root: BaseException = exc
+    while getattr(root, "__cause__", None) is not None:
+        root = root.__cause__  # type: ignore[assignment]
+
+    text = str(root).replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+
+    # Compress verbose enum validator messages:
+    #   system_layers items must be one of [...], got 'deployment'
+    # -> system_layers invalid list item 'deployment'
+    m = re.search(r"([A-Za-z0-9_]+) items must be one of .*?, got (.+)$", text)
+    if m:
+        return f"{m.group(1)} invalid list item {m.group(2)}"
+
+    m = re.search(r"([A-Za-z0-9_]+) must be one of .*?, got (.+)$", text)
+    if m:
+        return f"{m.group(1)} invalid enum value {m.group(2)}"
+
+    m = re.search(r"([A-Za-z0-9_]+) must be a list, got (.+)$", text)
+    if m:
+        return f"{m.group(1)} expected list, got {m.group(2)}"
+
+    m = re.search(r"([A-Za-z0-9_]+) must be boolean, got (.+)$", text)
+    if m:
+        return f"{m.group(1)} expected boolean, got {m.group(2)}"
+
+    return preview(text or type(exc).__name__, max_len)
 
 
 # =============================================================================
@@ -888,6 +969,7 @@ def compact_example_item() -> list:
 def render_metadata_user_prompt(
         expected_indices,
         batch_chunks: list,
+        retry_note: str | None = None,
 ) -> str:
     config = metadata_extraction_config()
     compact_row_fields = ",\n      ".join(compact_row_field_names())
@@ -919,6 +1001,7 @@ Example item:
 
 Chunks:
 {json.dumps(batch_chunks, ensure_ascii=False, indent=2)}
+{retry_note or ""}
 """
 
 def make_balanced_batches(
@@ -955,7 +1038,7 @@ def make_balanced_batches(
     return batches
 
 
-def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
+def extract_chunk_metadata_batch(batch_chunks: list, file_name: str, retry_note: str | None = None):
     STATS["metadata_actual_requests"] += 1
 
     start_chunk_index = batch_chunks[0]["chunk_index"] if batch_chunks else -1
@@ -966,6 +1049,7 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
     user_prompt = render_metadata_user_prompt(
         expected_indices=expected_indices,
         batch_chunks=batch_chunks,
+        retry_note=retry_note,
     )
 
     payload = {
@@ -1013,7 +1097,7 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
             raw_content=raw_content,
             batch_chunks=batch_chunks,
         )
-        raise MetadataExtractionError(f"Batch metadata JSON parse failed → {fail_path}")
+        raise MetadataExtractionError(f'Batch metadata JSON parse failed: could not parse JSON object with "items" list → {fail_path}')
 
     seen = set()
     result = {}
@@ -1031,7 +1115,7 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
                 raw_content=raw_content,
                 batch_chunks=batch_chunks,
             )
-            raise MetadataExtractionError(f"Batch metadata validation failed → {fail_path}") from e
+            raise MetadataExtractionError(f"Batch metadata validation failed: {e} → {fail_path}") from e
 
         if chunk_index not in expected_set:
             extra_indices.append(chunk_index)
@@ -1046,7 +1130,7 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
                 raw_content=raw_content,
                 batch_chunks=batch_chunks,
             )
-            raise MetadataExtractionError(f"Batch metadata duplicate index → {fail_path}")
+            raise MetadataExtractionError(f"Batch metadata duplicate index: duplicate chunk_index {chunk_index!r} → {fail_path}")
 
         result[chunk_index] = metadata
         seen.add(chunk_index)
@@ -1061,7 +1145,7 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
             raw_content=raw_content,
             batch_chunks=batch_chunks,
         )
-        raise MetadataExtractionError(f"Batch metadata missing items → {fail_path}")
+        raise MetadataExtractionError(f"Batch metadata missing items: expected {expected_indices!r}, got {sorted(seen)!r}, missing {missing!r} → {fail_path}")
 
     if extra_indices:
         fail_path = save_batch_metadata_failure(
@@ -1072,38 +1156,72 @@ def extract_chunk_metadata_batch(batch_chunks: list, file_name: str):
             raw_content=raw_content,
             batch_chunks=batch_chunks,
         )
-        raise MetadataExtractionError(f"Batch metadata returned extra chunk indices → {fail_path}")
+        raise MetadataExtractionError(f"Batch metadata returned extra chunk indices: extra {extra_indices!r}; expected only {expected_indices!r} → {fail_path}")
 
     return result
 
 
 def extract_chunk_metadata_batch_with_retry(batch_chunks: list, file_name: str):
-    try:
-        return extract_chunk_metadata_batch(batch_chunks, file_name=file_name)
-    except MetadataExtractionError:
-        if len(batch_chunks) <= 1:
-            raise
+    """Strict metadata extraction with fresh-call retries before split/fail.
 
-        STATS["metadata_retries"] += 1
+    A retry is a brand-new /v1/chat/completions request with the same chunks and
+    an extra schema-reminder note in the user prompt. It is not the same chat
+    context and does not include the invalid previous response.
 
-        mid = len(batch_chunks) // 2
-        left = batch_chunks[:mid]
-        right = batch_chunks[mid:]
+    Batch failures get a small same-size retry budget before recursive split.
+    Single-chunk failures get a larger retry budget before failing loudly, which
+    fixes the old fragile behavior where one bad enum from the LLM could stop
+    the whole ingest after splitting reached one chunk.
+    """
+    max_same_size_retries = (
+        METADATA_SINGLE_VALIDATION_RETRIES
+        if len(batch_chunks) <= 1
+        else METADATA_BATCH_VALIDATION_RETRIES
+    )
 
-        left_start = left[0]["chunk_index"]
-        left_end = left[-1]["chunk_index"]
-        right_start = right[0]["chunk_index"]
-        right_end = right[-1]["chunk_index"]
+    last_error: MetadataExtractionError | None = None
+    for attempt in range(max_same_size_retries + 1):
+        try:
+            note = STRICT_METADATA_RETRY_NOTE if attempt > 0 else None
+            if attempt > 0:
+                STATS["metadata_retries"] += 1
+                start = batch_chunks[0]["chunk_index"] + 1
+                end = batch_chunks[-1]["chunk_index"] + 1
+                reason = compact_metadata_error(last_error) if last_error else "schema validation failed"
+                log(
+                    f"  ↳ metadata protocol violation: {reason}; "
+                    f"batch size={len(batch_chunks)}; "
+                    f"fresh LLM retry {attempt}/{max_same_size_retries} for chunks {start}-{end}"
+                )
+            return extract_chunk_metadata_batch(batch_chunks, file_name=file_name, retry_note=note)
+        except MetadataExtractionError as e:
+            last_error = e
 
-        log(
-            f"  ↳ metadata protocol violation on batch size={len(batch_chunks)}; "
-            f"retry split {left_start + 1}-{left_end + 1} and {right_start + 1}-{right_end + 1}"
-        )
+    if len(batch_chunks) <= 1:
+        raise last_error or MetadataExtractionError("single-chunk metadata extraction failed")
 
-        result = {}
-        result.update(extract_chunk_metadata_batch_with_retry(left, file_name=file_name))
-        result.update(extract_chunk_metadata_batch_with_retry(right, file_name=file_name))
-        return result
+    STATS["metadata_retries"] += 1
+
+    mid = len(batch_chunks) // 2
+    left = batch_chunks[:mid]
+    right = batch_chunks[mid:]
+
+    left_start = left[0]["chunk_index"]
+    left_end = left[-1]["chunk_index"]
+    right_start = right[0]["chunk_index"]
+    right_end = right[-1]["chunk_index"]
+
+    reason = compact_metadata_error(last_error) if last_error else "schema validation failed"
+    log(
+        f"  ↳ metadata protocol violation: {reason}; "
+        f"batch size={len(batch_chunks)} after {max_same_size_retries} same-size retries; "
+        f"retry split {left_start + 1}-{left_end + 1} and {right_start + 1}-{right_end + 1}"
+    )
+
+    result = {}
+    result.update(extract_chunk_metadata_batch_with_retry(left, file_name=file_name))
+    result.update(extract_chunk_metadata_batch_with_retry(right, file_name=file_name))
+    return result
 
 
 # =============================================================================
@@ -1280,11 +1398,129 @@ def aggregate_document_metadata(chunk_metas):
 # Qdrant setup
 # =============================================================================
 
+
+# =============================================================================
+# Incremental Qdrant sync helpers
+# =============================================================================
+
+DOCUMENT_CHECKSUM_FIELD = "document_checksum"
+CHUNK_CHECKSUM_FIELD = "chunk_checksum"
+DOCUMENT_CHUNK_COUNT_FIELD = "document_chunk_count"
+INDEXED_AT_FIELD = "indexed_at"
+LAST_SEEN_AT_FIELD = "last_seen_at"
+INGEST_VERSION_FIELD = "ingest_version"
+INGEST_VERSION = 1
+LARGE_PRUNE_FRACTION = 0.50
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def deterministic_point_id(document_checksum: str, chunk_index: int) -> str:
+    # Stable across reruns and renames. If chunking/schema/embedding semantics change,
+    # the operator must delete the collection manually before ingesting again.
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DOMAIN.id}:{COLLECTION}:{document_checksum}:{chunk_index}"))
+
+
+def checksum_marker_path(document_checksum: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", document_checksum)
+    return Path(IN_PROGRESS_DIR) / f"{_safe_name(COLLECTION)}.{safe}.json"
+
+
+def write_in_progress_marker(document_checksum: str, source_path: Path) -> Path:
+    marker_path = checksum_marker_path(document_checksum)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "status": "in_progress",
+        "domain_id": DOMAIN.id,
+        "collection": COLLECTION,
+        "document_checksum": document_checksum,
+        "source_file_path": str(source_path),
+        "source_file_name": source_path.name,
+        "started_at": utc_now_iso(),
+    }
+    marker_path.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+    return marker_path
+
+
+def clear_in_progress_marker(document_checksum: str) -> None:
+    path = checksum_marker_path(document_checksum)
+    if path.exists():
+        path.unlink()
+
+
+def payload_filter(field: str, value) -> models.Filter:
+    return models.Filter(must=[models.FieldCondition(key=field, match=models.MatchValue(value=value))])
+
+
+def delete_points_by_field(client: QdrantClient, field: str, value) -> None:
+    client.delete(
+        collection_name=COLLECTION,
+        points_selector=models.FilterSelector(filter=payload_filter(field, value)),
+        wait=True,
+    )
+
+
+def update_points_by_checksum(client: QdrantClient, document_checksum: str, payload: dict) -> None:
+    client.set_payload(
+        collection_name=COLLECTION,
+        payload=payload,
+        points=models.FilterSelector(filter=payload_filter(DOCUMENT_CHECKSUM_FIELD, document_checksum)),
+        wait=True,
+    )
+
+
+def cleanup_stale_in_progress_markers(client: QdrantClient) -> None:
+    marker_dir = Path(IN_PROGRESS_DIR)
+    if not marker_dir.exists():
+        return
+    for marker_path in sorted(marker_dir.glob("*.json")):
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            log(f"STALE_MARKER_UNREADABLE path={marker_path}; removing marker only")
+            marker_path.unlink(missing_ok=True)
+            continue
+        if marker.get("collection") != COLLECTION:
+            continue
+        document_checksum = marker.get("document_checksum")
+        if isinstance(document_checksum, str) and document_checksum:
+            log(f"CLEANUP_IN_PROGRESS checksum={document_checksum} path={marker.get('source_file_path')}")
+            if client.collection_exists(COLLECTION):
+                delete_points_by_field(client, DOCUMENT_CHECKSUM_FIELD, document_checksum)
+            STATS["stale_in_progress_cleaned"] += 1
+        marker_path.unlink(missing_ok=True)
+
+
+def ensure_collection_exists(client: QdrantClient, dim: int) -> None:
+    if client.collection_exists(COLLECTION):
+        print(f"Using existing collection: {COLLECTION}")
+        return
+    print(f"Creating collection: {COLLECTION}")
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+    )
+    create_payload_indexes(client)
+
+
 def create_payload_indexes(client: QdrantClient):
     index_specs = unique_index_fields([
         ("file_path", models.PayloadSchemaType.KEYWORD),
         ("file_name", models.PayloadSchemaType.KEYWORD),
+        (DOCUMENT_CHECKSUM_FIELD, models.PayloadSchemaType.KEYWORD),
+        (CHUNK_CHECKSUM_FIELD, models.PayloadSchemaType.KEYWORD),
         ("chunk_index", models.PayloadSchemaType.INTEGER),
+        (DOCUMENT_CHUNK_COUNT_FIELD, models.PayloadSchemaType.INTEGER),
         (ROLE_FIELD, models.PayloadSchemaType.KEYWORD),
         (FACETS_FIELD, models.PayloadSchemaType.KEYWORD),
         (LAYERS_FIELD, models.PayloadSchemaType.KEYWORD),
@@ -1302,9 +1538,89 @@ def create_payload_indexes(client: QdrantClient):
         (DOC_DECISION_FIELD, models.PayloadSchemaType.KEYWORD),
     ])
 
-    log(f"Creating payload indexes: {', '.join(field for field, _ in index_specs)}")
+    log(f"Ensuring payload indexes: {', '.join(field for field, _ in index_specs)}")
     for field, schema in index_specs:
-        client.create_payload_index(COLLECTION, field, schema)
+        try:
+            client.create_payload_index(COLLECTION, field, schema)
+        except Exception as e:
+            # Qdrant returns an error if an index already exists. Existing indexes
+            # are fine for incremental sync; unexpected schema mismatches are an
+            # operator-level collection compatibility problem.
+            log(f"  payload index already exists or could not be created: {field} ({type(e).__name__})")
+
+
+def scroll_document_inventory(client: QdrantClient) -> dict[str, dict]:
+    """Return document inventory derived from Qdrant payload only.
+
+    The result is keyed by document_checksum. There is no local manifest; this
+    inventory is the source of truth for skip/update/prune decisions.
+    """
+    inventory: dict[str, dict] = {}
+    if not client.collection_exists(COLLECTION):
+        return inventory
+
+    offset = None
+    payload_fields = [
+        DOCUMENT_CHECKSUM_FIELD,
+        DOCUMENT_CHUNK_COUNT_FIELD,
+        "file_path",
+        "file_name",
+        LAST_SEEN_AT_FIELD,
+        INDEXED_AT_FIELD,
+    ]
+    while True:
+        records, offset = client.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=None,
+            limit=1024,
+            offset=offset,
+            with_payload=payload_fields,
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload or {}
+            checksum = payload.get(DOCUMENT_CHECKSUM_FIELD)
+            if not isinstance(checksum, str) or not checksum:
+                continue
+            entry = inventory.setdefault(
+                checksum,
+                {
+                    "document_checksum": checksum,
+                    "indexed_points": 0,
+                    "document_chunk_count": payload.get(DOCUMENT_CHUNK_COUNT_FIELD),
+                    "paths": set(),
+                    "file_names": set(),
+                },
+            )
+            entry["indexed_points"] += 1
+            if payload.get(DOCUMENT_CHUNK_COUNT_FIELD) is not None:
+                entry["document_chunk_count"] = payload.get(DOCUMENT_CHUNK_COUNT_FIELD)
+            if payload.get("file_path"):
+                entry["paths"].add(str(payload.get("file_path")))
+            if payload.get("file_name"):
+                entry["file_names"].add(str(payload.get("file_name")))
+        if offset is None:
+            break
+
+    return inventory
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Incrementally sync INPUT_DIR into the active Qdrant collection.",
+        epilog=(
+            "This script never deletes the collection. It prunes missing files only after "
+            "a non-empty input scan. If pruning would remove more than 50% of indexed "
+            "documents, rerun with --force-large-prune if that deletion is intentional. "
+            "If embedding/chunking/schema semantics changed, delete the collection manually."
+        ),
+    )
+    parser.add_argument(
+        "--force-large-prune",
+        action="store_true",
+        help="Allow pruning more than 50%% of indexed document checksums. Empty scans are still refused.",
+    )
+    return parser.parse_args()
 
 
 def print_document_metadata_summary(document_meta, chunk_metas):
@@ -1343,6 +1659,8 @@ def print_document_metadata_summary(document_meta, chunk_metas):
 # =============================================================================
 
 def main():
+    args = parse_args()
+
     files = []
     for root, _, names in os.walk(INPUT_DIR):
         for name in names:
@@ -1352,11 +1670,14 @@ def main():
 
     files.sort()
 
+    # Empty scans are treated as operator/configuration errors, never as an
+    # instruction to empty the index. This protects against wrong INPUT_DIR,
+    # failed mounts, deleted working directories, and CI/path mistakes.
     if not files:
-        raise SystemExit(f"No supported text files found in {INPUT_DIR}")
+        raise SystemExit(f"No supported text files found in {INPUT_DIR}; refusing to prune or index")
 
     print("=" * 100)
-    print("RAG INGEST START")
+    print("RAG INCREMENTAL INGEST START")
     print("=" * 100)
     print(f"Domain: {DOMAIN.id} ({DOMAIN.display_name})")
     print(f"Input dir: {INPUT_DIR}")
@@ -1365,6 +1686,9 @@ def main():
     print(f"Embedding URL: {EMBED_URL}")
     print(f"Chat URL: {CHAT_URL}")
     print(f"Files found: {len(files)}")
+    print("Mode: Qdrant-backed incremental sync; no local manifest; collection is never deleted")
+    print("Document identity: sha256(raw file bytes)")
+    print(f"Force large prune: {args.force_large_prune}")
     print(f"Chunking: paragraph/heading-aware; chunk_size_target={CHUNK_SIZE}; overlap={OVERLAP}")
     print(
         f"Metadata batching: target_batch_size={METADATA_TARGET_BATCH_SIZE}; "
@@ -1380,117 +1704,239 @@ def main():
     dim = len(embed("probe"))
     print(f"Embedding dimension probe: {dim}")
 
-    if client.collection_exists(COLLECTION):
-        print(f"Deleting existing collection: {COLLECTION}")
-        client.delete_collection(COLLECTION)
-
-    print(f"Creating collection: {COLLECTION}")
-    client.create_collection(
-        collection_name=COLLECTION,
-        vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
-    )
-
+    cleanup_stale_in_progress_markers(client)
+    ensure_collection_exists(client, dim)
     create_payload_indexes(client)
 
-    point_id = 1
+    inventory = scroll_document_inventory(client)
+    print(f"Indexed document checksums before sync: {len(inventory)}")
 
-    for file_num, path in enumerate(files, start=1):
-        print()
-        print("=" * 100)
-        print(f"FILE {file_num}/{len(files)}: {path.name}")
-        print("=" * 100)
+    # Read/chunk every current file once. Chunking is cheap relative to metadata
+    # extraction + embeddings and lets us validate existing indexed docs by
+    # document_chunk_count without doing expensive model calls.
+    current_docs = []
+    checksums_seen: set[str] = set()
+    duplicate_paths_by_checksum: dict[str, list[str]] = defaultdict(list)
 
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        print(f"  raw chars: {len(text)}")
-
+    for path in files:
+        raw_bytes = path.read_bytes()
+        document_checksum = sha256_bytes(raw_bytes)
+        text = raw_bytes.decode("utf-8", errors="ignore")
         chunks = chunk_text(text)
-        print_chunk_stats(chunks)
+        doc = {
+            "path": path,
+            "raw_bytes": raw_bytes,
+            "text": text,
+            "chunks": chunks,
+            "document_checksum": document_checksum,
+        }
+        if document_checksum in checksums_seen:
+            duplicate_paths_by_checksum[document_checksum].append(str(path))
+            log(f"DUPLICATE_CURRENT_FILE checksum={document_checksum} path={path}; first path wins")
+            continue
+        checksums_seen.add(document_checksum)
+        current_docs.append(doc)
 
-        STATS["chunks_total"] += len(chunks)
+    current_checksums = {doc["document_checksum"] for doc in current_docs}
 
-        chunk_metas = [None] * len(chunks)
-
-        batches = make_balanced_batches(
-            chunks,
-            target_batch_size=METADATA_TARGET_BATCH_SIZE,
-            target_max_initial_batches=METADATA_TARGET_MAX_INITIAL_BATCHES,
-            max_batch_size=METADATA_MAX_BATCH_SIZE,
-        )
-
-        STATS["metadata_initial_batches"] += len(batches)
-        print(f"  metadata batches planned: {[len(b) for b in batches]}")
-
-        for batch_num, batch in enumerate(batches, start=1):
-            start_index = batch[0]["chunk_index"]
-            end_index = batch[-1]["chunk_index"]
-
+    # Prune indexed documents no longer represented by any current file checksum.
+    # This makes the index reflect the current input directory while still being
+    # guarded against wrong INPUT_DIR or mass accidental deletion.
+    missing_checksums = sorted(set(inventory) - current_checksums)
+    indexed_count = len(inventory)
+    if missing_checksums:
+        prune_fraction = len(missing_checksums) / max(1, indexed_count)
+        if prune_fraction > LARGE_PRUNE_FRACTION and not args.force_large_prune:
+            print("=" * 100)
+            print("REFUSING LARGE PRUNE")
+            print("=" * 100)
             print(
-                f"  metadata batch {batch_num}/{len(batches)} "
-                f"chunks {start_index + 1}-{end_index + 1}/{len(chunks)} "
-                f"size={len(batch)}",
-                flush=True,
+                f"Would prune {len(missing_checksums)}/{indexed_count} indexed document checksums "
+                f"({prune_fraction:.1%}), which is above {LARGE_PRUNE_FRACTION:.0%}."
+            )
+            print("No points were deleted for missing files.")
+            print("If this is intentional, rerun:")
+            print("  python3 ingest.py --force-large-prune")
+            raise SystemExit(2)
+
+        if args.force_large_prune and prune_fraction > LARGE_PRUNE_FRACTION:
+            print(
+                f"FORCE_LARGE_PRUNE enabled: pruning {len(missing_checksums)}/{indexed_count} "
+                f"indexed document checksums ({prune_fraction:.1%})"
             )
 
-            try:
-                batch_result = extract_chunk_metadata_batch_with_retry(batch, file_name=path.name)
-            except Exception:
-                print(f"❌ FAILED: {path.name} batch={batch_num} start_chunk={start_index}")
-                raise
+        for checksum in missing_checksums:
+            log(f"PRUNE_MISSING checksum={checksum}")
+            delete_points_by_field(client, DOCUMENT_CHECKSUM_FIELD, checksum)
+            STATS["files_pruned"] += 1
 
-            for chunk_index, meta in batch_result.items():
-                chunk_metas[chunk_index] = meta
+    # Refresh inventory after prune so skip/reindex decisions see current state.
+    # We intentionally do not treat source_file_path as document identity.
+    # Document identity is document_checksum. If bytes change at the same path,
+    # the new checksum is ingested below and the old checksum was removed by the
+    # missing-checksum prune above. Rename stays simple: same checksum, new path
+    # only updates path/name payload.
+    inventory = scroll_document_inventory(client)
 
-        if any(m is None for m in chunk_metas):
-            missing = [i for i, m in enumerate(chunk_metas) if m is None]
-            raise RuntimeError(f"Missing metadata for chunks: {missing}")
+    for file_num, doc in enumerate(current_docs, start=1):
+        path = doc["path"]
+        text = doc["text"]
+        chunks = doc["chunks"]
+        document_checksum = doc["document_checksum"]
+        now = utc_now_iso()
 
-        document_meta = aggregate_document_metadata(chunk_metas)
-        print_document_metadata_summary(document_meta, chunk_metas)
+        print()
+        print("=" * 100)
+        print(f"FILE {file_num}/{len(current_docs)}: {path.name}")
+        print("=" * 100)
+        print(f"  checksum: {document_checksum}")
+        print(f"  raw chars: {len(text)}")
+        print_chunk_stats(chunks)
 
-        points = []
-        skipped_drop = 0
-
-        for i, chunk in enumerate(chunks):
-            chunk_meta = chunk_metas[i]
-
-            if chunk_meta.get(DECISION_FIELD) in DECISION_DROP_VALUES and not INDEX_DROPPED_CHUNKS:
-                skipped_drop += 1
-                continue
-
-            vec = embed(chunk)
-
-            payload = {
+        existing = inventory.get(document_checksum)
+        expected_chunk_count = len(chunks)
+        if existing and int(existing.get("document_chunk_count") or -1) == expected_chunk_count:
+            old_paths = set(existing.get("paths") or set())
+            new_payload = {
                 "file_path": str(path),
                 "file_name": path.name,
-                "chunk_index": i,
-                "content": chunk,
-                **chunk_meta,
-                **document_meta,
+                "source_file_path": str(path),
+                "source_file_name": path.name,
+                LAST_SEEN_AT_FIELD: now,
             }
+            update_points_by_checksum(client, document_checksum, new_payload)
+            if old_paths and old_paths != {str(path)}:
+                print(f"  UPDATED_PATH old={sorted(old_paths)} new={path}")
+                STATS["files_path_updated"] += 1
+            else:
+                print("  SKIPPED existing checksum with matching chunk count")
+                STATS["files_skipped"] += 1
+            continue
 
-            points.append(models.PointStruct(id=point_id, vector=vec, payload=payload))
-            point_id += 1
+        if existing:
+            print(
+                "  REINDEX_INCOMPLETE_OR_MISMATCHED "
+                f"existing_document_chunk_count={existing.get('document_chunk_count')} "
+                f"expected={expected_chunk_count}"
+            )
+            delete_points_by_field(client, DOCUMENT_CHECKSUM_FIELD, document_checksum)
 
-        if points:
-            client.upsert(collection_name=COLLECTION, points=points)
+        marker_path = write_in_progress_marker(document_checksum, path)
+        try:
+            STATS["chunks_total"] += len(chunks)
 
-        STATS["points_total"] += len(points)
-        STATS["dropped_chunks_skipped"] += skipped_drop
+            chunk_metas = [None] * len(chunks)
 
-        print(f"  skipped drop chunks: {skipped_drop}")
-        print(f"  upserted points: {len(points)}")
+            batches = make_balanced_batches(
+                chunks,
+                target_batch_size=METADATA_TARGET_BATCH_SIZE,
+                target_max_initial_batches=METADATA_TARGET_MAX_INITIAL_BATCHES,
+                max_batch_size=METADATA_MAX_BATCH_SIZE,
+            )
+
+            STATS["metadata_initial_batches"] += len(batches)
+            print(f"  metadata batches planned: {[len(b) for b in batches]}")
+
+            for batch_num, batch in enumerate(batches, start=1):
+                start_index = batch[0]["chunk_index"]
+                end_index = batch[-1]["chunk_index"]
+
+                print(
+                    f"  metadata batch {batch_num}/{len(batches)} "
+                    f"chunks {start_index + 1}-{end_index + 1}/{len(chunks)} "
+                    f"size={len(batch)}",
+                    flush=True,
+                )
+
+                try:
+                    batch_result = extract_chunk_metadata_batch_with_retry(batch, file_name=path.name)
+                except Exception:
+                    print(f"❌ FAILED: {path.name} batch={batch_num} start_chunk={start_index}")
+                    raise
+
+                for chunk_index, meta in batch_result.items():
+                    chunk_metas[chunk_index] = meta
+
+            if any(m is None for m in chunk_metas):
+                missing = [i for i, m in enumerate(chunk_metas) if m is None]
+                raise RuntimeError(f"Missing metadata for chunks: {missing}")
+
+            document_meta = aggregate_document_metadata(chunk_metas)
+            print_document_metadata_summary(document_meta, chunk_metas)
+
+            points = []
+            skipped_drop = 0
+
+            for i, chunk in enumerate(chunks):
+                chunk_meta = chunk_metas[i]
+
+                if chunk_meta.get(DECISION_FIELD) in DECISION_DROP_VALUES and not INDEX_DROPPED_CHUNKS:
+                    skipped_drop += 1
+                    continue
+
+                vec = embed(chunk)
+                point_uid = deterministic_point_id(document_checksum, i)
+
+                payload = {
+                    "file_path": str(path),
+                    "file_name": path.name,
+                    "source_file_path": str(path),
+                    "source_file_name": path.name,
+                    "chunk_index": i,
+                    "content": chunk,
+                    DOCUMENT_CHECKSUM_FIELD: document_checksum,
+                    CHUNK_CHECKSUM_FIELD: sha256_text(chunk),
+                    DOCUMENT_CHUNK_COUNT_FIELD: len(chunks),
+                    INDEXED_AT_FIELD: now,
+                    LAST_SEEN_AT_FIELD: now,
+                    INGEST_VERSION_FIELD: INGEST_VERSION,
+                    **chunk_meta,
+                    **document_meta,
+                }
+
+                points.append(models.PointStruct(id=point_uid, vector=vec, payload=payload))
+
+            if points:
+                client.upsert(collection_name=COLLECTION, points=points)
+
+            STATS["points_total"] += len(points)
+            STATS["dropped_chunks_skipped"] += skipped_drop
+            STATS["files_added"] += 1
+
+            print(f"  skipped drop chunks: {skipped_drop}")
+            print(f"  upserted points: {len(points)}")
+
+            clear_in_progress_marker(document_checksum)
+            inventory[document_checksum] = {
+                "document_checksum": document_checksum,
+                "indexed_points": len(points),
+                "document_chunk_count": len(chunks),
+                "paths": {str(path)},
+                "file_names": {path.name},
+            }
+        except Exception:
+            print(f"  ingest failed; partial points will be cleaned on next start via {marker_path}")
+            raise
 
     print()
     print("=" * 100)
-    print("RAG INGEST DONE")
+    print("RAG INCREMENTAL INGEST DONE")
     print("=" * 100)
-    print(f"Files processed: {len(files)}")
-    print(f"Chunks total: {STATS['chunks_total']}")
+    print(f"Files scanned: {len(files)}")
+    print(f"Unique document checksums in scan: {len(current_docs)}")
+    print(f"Duplicate current files skipped by checksum: {sum(len(v) for v in duplicate_paths_by_checksum.values())}")
+    print(f"Stale in-progress docs cleaned: {STATS['stale_in_progress_cleaned']}")
+    print(f"Files added/reindexed: {STATS['files_added']}")
+    print(f"Files skipped unchanged: {STATS['files_skipped']}")
+    print(f"Renamed files path-updated: {STATS['files_path_updated']}")
+    print(f"Missing documents pruned: {STATS['files_pruned']}")
+    print(f"Chunks total for indexed/reindexed files: {STATS['chunks_total']}")
     print(f"Initial metadata batches: {STATS['metadata_initial_batches']}")
     print(f"Actual metadata requests including retries: {STATS['metadata_actual_requests']}")
-    print(f"Metadata retry splits: {STATS['metadata_retries']}")
+    print(f"Metadata retry attempts/splits: {STATS['metadata_retries']}")
+    print(f"Metadata same-size retry budget: batch={METADATA_BATCH_VALIDATION_RETRIES}, single={METADATA_SINGLE_VALIDATION_RETRIES}")
     print(f"Drop chunks skipped: {STATS['dropped_chunks_skipped']}")
-    print(f"Points inserted: {STATS['points_total']}")
+    print(f"Points inserted/upserted: {STATS['points_total']}")
     print(f"Collection: {COLLECTION}")
     print("=" * 100)
 
